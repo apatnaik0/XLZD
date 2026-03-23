@@ -1,0 +1,32 @@
+# Raw data
+data/**
+!data/.gitkeep
+
+# Generated outputs
+outputs/**
+!outputs/.gitkeep
+!outputs/**/
+!outputs/**/.gitkeep
+
+outputs_smoke/**
+!outputs_smoke/.gitkeep
+!outputs_smoke/**/
+!outputs_smoke/**/.gitkeep
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor files
+.DS_Store
+.idea/
+.vscode/
