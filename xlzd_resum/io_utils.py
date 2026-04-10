@@ -155,6 +155,7 @@ def load_event_file(path: Path, *, max_rows: Optional[int] = None) -> pd.DataFra
     raw = _try_read_table(path, nrows=max_rows)
     df = _normalize_columns(raw, path)
     df["r"] = np.sqrt(df["x"].to_numpy() ** 2 + df["y"].to_numpy() ** 2)
+    df["s_r"] = np.sqrt(df["sx"].to_numpy() ** 2 + df["sy"].to_numpy() ** 2)
     df["source_component"] = infer_component_name(path)
     df["source_file"] = path.name
     return df

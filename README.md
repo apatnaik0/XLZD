@@ -1,8 +1,11 @@
-# XLZD Pool/Block Theta Data Preparation
+# XLZD RESuM Pipeline
 
 XLZD is a multi-purpose liquid-xenon rare-event observatory with physics goals including dark matter, neutrinoless double-beta decay, and neutrino studies.
 
-This codebase prepares XLZD background simulation data for the current pool/block-based spatial workflow.
+This codebase now covers both:
+
+- pool/block-based XLZD data preparation
+- RESuM-style CNP + MF-GP modeling on the generated theta files
 
 The input files are already preselected:
 
@@ -35,10 +38,12 @@ The loader preserves the first column as `global_event_id`.
 The code computes:
 
 - `r = sqrt(x^2 + y^2)`
+- `s_r = sqrt(sx^2 + sy^2)`
 
-and also computes a centered axial coordinate:
+and also computes centered axial coordinates:
 
 - `z_from_center = abs(z - z_center)`
+- `s_z_from_center = abs(sz - z_center)`
 
 where:
 
@@ -52,9 +57,10 @@ From inspecting the raw files:
 - `x` and `y` both take positive and negative values and behave like centered transverse coordinates
 - `z` runs approximately from `0` to the chamber extent rather than being centered around `0`
 
-So the code treats raw `z` as an axial coordinate and derives a centered quantity:
+So the code treats raw `z` as an axial coordinate and derives centered quantities for both:
 
-- `z_from_center = abs(z - z_center)`
+- final position: `z_from_center = abs(z - z_center)`
+- initial position: `s_z_from_center = abs(sz - z_center)`
 
 Reference material:
 
@@ -177,13 +183,13 @@ Then:
 
 - sample `n` LF theta values from the LF support
 - choose `m` of those LF theta values for the HF training blocks
-- assign HF-based theta values to the `k` validation blocks
+- sample `k` separate validation theta values for the HF validation blocks
 
 This preserves the important rule:
 
 - every HF theta is also present in LF
 
-while allowing validation to be held out in a separate pool.
+while keeping the HF validation theta set separate from the training theta set.
 
 ## What Each Output File Contains
 
@@ -192,7 +198,9 @@ Each LF/HF/validation block file contains:
 - the sampled event rows from that block
 - original event columns
 - `r`
+- `s_r`
 - `z_from_center`
+- `s_z_from_center`
 - `source_component`
 - `source_file`
 - theta metadata:
@@ -209,31 +217,104 @@ where:
 
 ## Code Layout
 
-- [prepare_resum_data.py](/Users/anishpatnaik/Documents/XLZD/prepare_resum_data.py): runnable entrypoint, config loading, pool/block pipeline, and summary printing
-- [xlzd_resum/config.py](/Users/anishpatnaik/Documents/XLZD/xlzd_resum/config.py): config dataclasses
-- [xlzd_resum/io_utils.py](/Users/anishpatnaik/Documents/XLZD/xlzd_resum/io_utils.py): robust input loading and saving
-- [xlzd_resum/theta.py](/Users/anishpatnaik/Documents/XLZD/xlzd_resum/theta.py): centered theta definitions and `z_from_center` logic
-- [xlzd_resum/dataset.py](/Users/anishpatnaik/Documents/XLZD/xlzd_resum/dataset.py): pool splitting, block splitting, theta assignment, and file writing
-- [config/pipeline_config.json](/Users/anishpatnaik/Documents/XLZD/config/pipeline_config.json): main config
-- [config/pipeline_config_smoke.json](/Users/anishpatnaik/Documents/XLZD/config/pipeline_config_smoke.json): smoke-test config
+- [`prepare_resum_data.py`](prepare_resum_data.py): runnable entrypoint, config loading, pool/block pipeline, and summary printing
+- [`convert_csv_to_h5_xlzd.py`](convert_csv_to_h5_xlzd.py): converts per-theta CSV/parquet files into HDF5 files for the CNP
+- [`xlzd_resum/config.py`](xlzd_resum/config.py): config dataclasses
+- [`xlzd_resum/io_utils.py`](xlzd_resum/io_utils.py): robust input loading and saving
+- [`xlzd_resum/theta.py`](xlzd_resum/theta.py): centered theta definitions and `z_from_center` logic
+- [`xlzd_resum/dataset.py`](xlzd_resum/dataset.py): pool splitting, block splitting, theta assignment, and file writing
+- [`config/pipeline_config.json`](config/pipeline_config.json): main config
+- [`config/pipeline_config_smoke.json`](config/pipeline_config_smoke.json): smoke-test config
+- [`src/xlzd/settings.yaml`](src/xlzd/settings.yaml): main RESuM/CNP/MFGP settings for training LF + training HF
+- [`src/xlzd/settings_validation.yaml`](src/xlzd/settings_validation.yaml): CNP prediction settings for held-out HF validation files
+- [`src/run_cnp/cnp_clean_pipeline.py`](src/run_cnp/cnp_clean_pipeline.py): self-contained CNP train/predict pipeline
+- [`src/run_cnp/cnp_xlzd_workflow.ipynb`](src/run_cnp/cnp_xlzd_workflow.ipynb): CNP-only notebook for training, prediction, and inline visualization
+- [`src/run_cnp/cnp_predict_per_signal.py`](src/run_cnp/cnp_predict_per_signal.py): optional per-event CNP export
+- [`src/run_cnp/preprocess_mixup_xlzd.py`](src/run_cnp/preprocess_mixup_xlzd.py): optional mixup preprocessing on H5 training files
+- [`src/run_mfgp/mfgp_clean_pipeline.py`](src/run_mfgp/mfgp_clean_pipeline.py): clean MF-GP fit/inference from CNP output CSVs
+- [`src/run_mfgp/mfgp_xlzd_workflow.ipynb`](src/run_mfgp/mfgp_xlzd_workflow.ipynb): MF-GP notebook for fitting, inference, and inline visualization
+- [`requirements.txt`](requirements.txt): minimal Python dependencies
+
+## Install
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 ## How To Run
 
-Normal run:
+Prepare the theta files:
 
 ```bash
 python3 prepare_resum_data.py
 ```
 
-Smoke test:
+Convert the generated per-theta files to HDF5 for the CNP:
+
+```bash
+python3 convert_csv_to_h5_xlzd.py
+```
+
+Train the CNP on LF and predict on LF+HF training files:
+
+```bash
+python3 src/run_cnp/cnp_clean_pipeline.py
+```
+
+Or run the CNP-only notebook:
+
+- open [`src/run_cnp/cnp_xlzd_workflow.ipynb`](src/run_cnp/cnp_xlzd_workflow.ipynb)
+- execute the cells in order after the H5 conversion step is complete
+
+Run CNP prediction on the held-out HF validation files with the trained model:
+
+```bash
+python3 src/run_cnp/cnp_validation_prediction.py
+```
+
+Fit the MF-GP using the CNP output from training LF+HF:
+
+```bash
+python3 src/run_mfgp/mfgp_clean_pipeline.py --config src/xlzd/settings.yaml
+```
+
+Or run the MF-GP notebook:
+
+- open [`src/run_mfgp/mfgp_xlzd_workflow.ipynb`](src/run_mfgp/mfgp_xlzd_workflow.ipynb)
+- execute the cells in order after the CNP outputs are available in `data/out/cnp`
+
+Smoke test for the data-preparation stage:
 
 ```bash
 python3 prepare_resum_data.py --config config/pipeline_config_smoke.json
 ```
 
+## RESuM Mapping
+
+The XLZD RESuM interface used here is:
+
+| RESuM quantity | XLZD columns |
+| --- | --- |
+| `theta` | `["R_max", "Z_max"]` |
+| `phi` | `["s_r", "s_z_from_center"]` |
+| target | `["inside_theta"]` |
+| LF files | `outputs/training/lf/*.csv` then `.h5` |
+| HF files | `outputs/training/hf/*.csv` then `.h5` |
+| validation files | `outputs/validation/hf/*.csv` then `.h5` |
+
+Each theta file contains all events from one block. The CNP sees:
+
+- global configuration: `theta = (R_max, Z_max)`
+- event-specific features: `phi = (s_r, s_z_from_center)`
+- binary target: `inside_theta`, defined from the final position
+
+The MF-GP then operates on the aggregated CNP output CSV where each row is one theta/fidelity configuration.
+
 ## Main Config Fields
 
-Edit [config/pipeline_config.json](/Users/anishpatnaik/Documents/XLZD/config/pipeline_config.json).
+Edit [`config/pipeline_config.json`](config/pipeline_config.json).
 
 Most important fields:
 

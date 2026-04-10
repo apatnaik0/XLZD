@@ -10,6 +10,7 @@ import pandas as pd
 from .config import ThetaSamplingConfig
 
 Z_FROM_CENTER_COLUMN = "z_from_center"
+INITIAL_Z_FROM_CENTER_COLUMN = "s_z_from_center"
 
 
 @dataclass(slots=True)
@@ -56,10 +57,12 @@ def infer_z_center(df: pd.DataFrame, config: ThetaSamplingConfig) -> float:
 
 
 def add_centered_z_coordinate(df: pd.DataFrame, z_center: float) -> pd.DataFrame:
-    """Add the absolute distance from the inferred/provided z center."""
+    """Add centered axial distances for final and initial z coordinates."""
 
     out = df.copy()
     out[Z_FROM_CENTER_COLUMN] = np.abs(out["z"].to_numpy(dtype=float) - float(z_center))
+    if "sz" in out.columns:
+        out[INITIAL_Z_FROM_CENTER_COLUMN] = np.abs(out["sz"].to_numpy(dtype=float) - float(z_center))
     return out
 
 

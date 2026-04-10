@@ -128,13 +128,23 @@ def _build_theta_table(
     rng: np.random.Generator,
     random_seed: int,
     num_thetas: int,
+    excluded_theta_keys: set[tuple[float, float]] | None = None,
+    rounding_decimals: int = 6,
 ) -> pd.DataFrame:
     """Generate a dataframe of centered theta regions."""
 
     bounds = infer_theta_bounds(df_for_bounds, theta_config)
+    excluded_theta_keys = set() if excluded_theta_keys is None else set(excluded_theta_keys)
     records: list[dict[str, float | int]] = []
-    for _ in range(num_thetas):
+    while len(records) < num_thetas:
         theta = sample_theta_region(rng, bounds)
+        theta_key = (
+            round(float(theta.R_max), rounding_decimals),
+            round(float(theta.Z_max), rounding_decimals),
+        )
+        if theta_key in excluded_theta_keys:
+            continue
+        excluded_theta_keys.add(theta_key)
         records.append(
             {
                 "random_seed_used": random_seed,
@@ -153,7 +163,7 @@ def build_theta_sets_from_blocks(
     df_for_bounds: pd.DataFrame,
     random_seed: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Build LF theta set and choose HF/validation theta sets from it."""
+    """Build LF/HF training theta sets and a separate held-out validation theta set."""
 
     if not lf_blocks.blocks:
         raise ValueError("LF pool produced zero blocks.")
@@ -182,13 +192,18 @@ def build_theta_sets_from_blocks(
     hf_indices = np.sort(rng.choice(n, size=m, replace=False))
     hf_theta_df = lf_theta_df.iloc[hf_indices].reset_index(drop=True)
 
-    if k <= m:
-        validation_theta_df = hf_theta_df.iloc[:k].reset_index(drop=True)
-    else:
-        reps = int(np.ceil(k / m))
-        repeated = pd.concat([hf_theta_df] * reps, ignore_index=True)
-        validation_theta_df = repeated.iloc[:k].reset_index(drop=True)
-    validation_theta_df = validation_theta_df.copy()
+    training_theta_keys = {
+        (round(float(row.R_max), 6), round(float(row.Z_max), 6))
+        for row in lf_theta_df.itertuples(index=False)
+    }
+    validation_theta_df = _build_theta_table(
+        theta_config=theta_config,
+        df_for_bounds=df_for_bounds,
+        rng=rng,
+        random_seed=random_seed,
+        num_thetas=k,
+        excluded_theta_keys=training_theta_keys,
+    )
     validation_theta_df["validation_theta_instance"] = np.arange(len(validation_theta_df))
 
     return lf_theta_df.reset_index(drop=True), hf_theta_df, validation_theta_df

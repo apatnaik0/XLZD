@@ -1,6 +1,8 @@
 # Raw data
 data/**
 !data/.gitkeep
+!data/**/
+!data/**/.gitkeep
 
 # Generated outputs
 outputs/**
