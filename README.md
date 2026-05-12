@@ -1,241 +1,179 @@
-# XLZD RESuM Pipeline
+# XLZD
 
-XLZD is a multi-purpose liquid-xenon rare-event observatory with physics goals including dark matter, neutrinoless double-beta decay, and neutrino studies.
+Code and experiment workflows for CNP and MF-GP modeling on XLZD event data.
 
-This codebase now covers both:
+This repository contains:
 
-- pool/block-based XLZD data preparation
-- RESuM-style CNP + MF-GP modeling on the generated theta files
+- the standard RESuM-style LF/HF preprocessing pipeline
+- CNP training and prediction workflows
+- MF-GP fitting and visualization workflows
+- alternative theta experiments
+- depth-penetration modeling experiments and interactive visualizations
 
-The input files are already preselected:
+## Repository Structure
 
-- narrow ROI around the Q-value
-- single-site only
-- veto already applied
+### Core pipeline
 
-## Raw Data Columns
+- [`prepare_resum_data.py`](prepare_resum_data.py)
+  - builds the standard LF/HF/validation block files for the cumulative-theta workflow
+- [`convert_csv_to_h5_xlzd.py`](convert_csv_to_h5_xlzd.py)
+  - converts generated CSV/parquet blocks to H5 for the CNP
+- [`xlzd_resum/`](xlzd_resum)
+  - shared preprocessing, theta, config, and dataset utilities
+- [`src/xlzd/`](src/xlzd)
+  - standard settings files for CNP and MF-GP experiments
+- [`src/run_cnp/`](src/run_cnp)
+  - CNP training, prediction, and notebook workflows
+- [`src/run_mfgp/`](src/run_mfgp)
+  - MF-GP fitting, prediction, and visualization workflows
 
-Each row is one event with:
+### Experiment folders
 
-- `global_event_id`
-- `E0`
-- `sx`, `sy`, `sz`
-- `ETPC`
-- `x`, `y`, `z`
+- [`depth_penetration_experiments/`](depth_penetration_experiments)
+  - event penetration modeling, MLP/VBLL baselines, and Plotly explorers
+- [`lf_augmentations/`](lf_augmentations)
+  - experiments that add synthetic LF trials at existing theta values
+- [`theta_augmentations/`](theta_augmentations)
+  - experiments that add LF support at new synthetic theta values
+- [`xlzd_shell_theta/`](xlzd_shell_theta)
+  - a separate shell-based theta experiment where theta is local rather than cumulative
 
-Interpretation:
+## Main Workflows
 
-- `global_event_id`: unique event identifier
-- `E0`: initial energy
-- `sx`, `sy`, `sz`: initial coordinates
-- `ETPC`: energy deposited in the TPC
-- `x`, `y`, `z`: final coordinates
+### 1. Standard cumulative-theta workflow
 
-The loader preserves the first column as `global_event_id`.
+Use this for the original theta definition:
 
-## Final Position Coordinates
+- `theta = (R_max, Z_max)`
+- target = whether an event falls inside that cumulative centered region
 
-The code computes:
+Run order:
 
-- `r = sqrt(x^2 + y^2)`
-- `s_r = sqrt(sx^2 + sy^2)`
+```bash
+python3 prepare_resum_data.py
+python3 convert_csv_to_h5_xlzd.py
+```
 
-and also computes centered axial coordinates:
+Then run:
 
-- `z_from_center = abs(z - z_center)`
-- `s_z_from_center = abs(sz - z_center)`
+- [`src/run_cnp/cnp_xlzd_workflow.ipynb`](src/run_cnp/cnp_xlzd_workflow.ipynb)
+- [`src/run_mfgp/mfgp_xlzd_workflow.ipynb`](src/run_mfgp/mfgp_xlzd_workflow.ipynb)
 
-where:
+Inside the main CNP notebook, set `EXPERIMENT` to one of:
 
-- `z_center` is inferred by default as the midpoint of the observed `z` range
-- or can be provided explicitly in the config
+- `default`
+- `minibatch`
+- `fixedcontext`
+- `fullpass`
 
-This is used because theta is defined relative to the chamber center in the current workflow.
+### 2. Shell-theta workflow
 
-From inspecting the raw files:
+Use this for the alternative shell-based theta definition:
 
-- `x` and `y` both take positive and negative values and behave like centered transverse coordinates
-- `z` runs approximately from `0` to the chamber extent rather than being centered around `0`
+- `theta = (r_shell, z_shell)`
+- target = whether an event falls near a local shell-centered region
 
-So the code treats raw `z` as an axial coordinate and derives centered quantities for both:
+Run order:
 
-- final position: `z_from_center = abs(z - z_center)`
-- initial position: `s_z_from_center = abs(sz - z_center)`
+```bash
+python3 xlzd_shell_theta/prepare_shell_theta_data.py
+python3 xlzd_shell_theta/convert_shell_theta_to_h5.py
+```
 
-Reference material:
+Then run:
 
-- XLZD collaboration site: https://xlzd.org/
-- XLZD design report: https://link.springer.com/article/10.1140/epjc/s10052-025-14810-w
-- STFC XLZD overview: https://www.ppd.stfc.ac.uk/Pages/XLZD.aspx
+- [`xlzd_shell_theta/00_shell_theta_cnp_workflow.ipynb`](xlzd_shell_theta/00_shell_theta_cnp_workflow.ipynb)
+- [`xlzd_shell_theta/01_shell_theta_mfgp.ipynb`](xlzd_shell_theta/01_shell_theta_mfgp.ipynb)
 
-## Centered Theta Definition
+This shell-theta workflow is intentionally separate from the standard cumulative-theta workflow.
 
-Theta is centered and uses only two parameters:
+## CNP Workflows
 
-- `R_max`
-- `Z_max`
+Main notebook:
 
-An event is inside theta if:
+- [`src/run_cnp/cnp_xlzd_workflow.ipynb`](src/run_cnp/cnp_xlzd_workflow.ipynb)
 
-- `r <= R_max`
-- `z_from_center <= Z_max`
+This is the primary notebook for standard CNP experiments.
 
-So theta defines a centered detector volume grown outward from the chamber center.
+Archived fixed-path notebooks are kept under:
 
-Theta in this workflow is only this 2D pair:
+- [`src/run_cnp/additional_experiments/`](src/run_cnp/additional_experiments)
 
-- `(R, Z) = (R_max, Z_max)`
+These are retained for reference only. The main switchable notebook should be the default entry point.
 
-There is no separate theta identifier in the generated data files.
+Important CNP scripts:
 
-## Three Disjoint Pools
+- [`src/run_cnp/cnp_clean_pipeline.py`](src/run_cnp/cnp_clean_pipeline.py)
+  - train/predict pipeline
+- [`src/run_cnp/cnp_predict_per_signal.py`](src/run_cnp/cnp_predict_per_signal.py)
+  - per-event/per-signal prediction export
+- [`src/run_cnp/cnp_validation_prediction.py`](src/run_cnp/cnp_validation_prediction.py)
+  - validation prediction helper
+- [`src/run_cnp/preprocess_mixup_xlzd.py`](src/run_cnp/preprocess_mixup_xlzd.py)
+  - optional mixup preprocessing
 
-The full dataset is shuffled once and split into three non-overlapping pools:
+## MF-GP Workflows
 
-- LF training pool
-- HF training pool
-- HF validation pool
+Main notebook:
 
-By default the proportions are:
+- [`src/run_mfgp/mfgp_xlzd_workflow.ipynb`](src/run_mfgp/mfgp_xlzd_workflow.ipynb)
 
-- LF training pool: `20%`
-- HF training pool: `40%`
-- HF validation pool: remaining `40%`
+Main script:
 
-These are configurable.
+- [`src/run_mfgp/mfgp_clean_pipeline.py`](src/run_mfgp/mfgp_clean_pipeline.py)
 
-## Approximate Counts With The Current Dataset
+This workflow consumes aggregated CNP CSV outputs and produces:
 
-Using the original seven-file dataset counts discussed during development, the total event count is approximately:
+- MF-GP fits
+- mean/std surfaces
+- parity plots
+- validation plots
+- 3D HTML views where enabled
 
-- `5,325,583` events
+## Depth Penetration Experiments
 
-With the current default pool proportions:
+Folder:
 
-- LF training pool (`20%`): about `1.07M` events
-- HF training pool (`40%`): about `2.13M` events
-- HF validation pool (remainder): about `2.13M` events
+- [`depth_penetration_experiments/`](depth_penetration_experiments)
 
-These are planning figures. The exact counts depend on the exact dataset size at runtime.
+This contains a separate modeling track for event penetration into the detector, including:
 
-## Blocks
+- global `d_center` prediction
+- grouped axial/radial prediction
+- deterministic MLP and VBLL-head models
+- interactive 2D and 3D Plotly explorers
 
-Each pool is split into equal-size blocks:
+Start with:
 
-- LF training blocks of size `10,000`
-- HF training blocks of size `100,000`
-- HF validation blocks of size `100,000`
+- [`depth_penetration_experiments/README.md`](depth_penetration_experiments/README.md)
 
-These block sizes are configurable. Extra rows are spread across the blocks so almost all available events are used.
+## LF and Theta Augmentation Experiments
 
-With the current defaults and a dataset of about `5.33M` events, the expected file counts are approximately:
+These folders contain exploratory work and are not part of the main pipeline:
 
-- `n ≈ 106` LF training files
-- `m ≈ 21` HF training files
-- `k ≈ 21` HF validation files
+- [`lf_augmentations/`](lf_augmentations)
+- [`theta_augmentations/`](theta_augmentations)
 
-## Example Run Summary
+They are useful when testing whether MF-GP behavior improves with:
 
-With the current full dataset and default settings, a representative run produced:
+- more LF support at existing theta values
+- synthetic LF support at nearby or midpoint theta values
 
-| Quantity | Value |
-| --- | --- |
-| Total events | `5,325,583` |
-| Inferred `z_center` | `1982.48` |
-| Final-position `z` range | `[0.112398, 3964.85]` |
-| Final-position `r` range | `[1.22868, 1489.87]` |
+## Outputs
 
-| Pool | Size |
-| --- | ---: |
-| LF training | `1,065,116` |
-| HF training | `2,130,233` |
-| HF validation | `2,130,234` |
+Generated artifacts are typically written under:
 
-| Split | Files | Block size range | Unused leftover rows |
-| --- | ---: | --- | ---: |
-| LF training | `106` | `10048-10049` | `0` |
-| HF training | `21` | `101439-101440` | `0` |
-| HF validation | `21` | `101439-101440` | `0` |
+- `outputs/`
+- `outputs_shell_theta/`
+- `data/out/cnp/`
+- `data/out/mfgp/`
+- experiment-specific `artifacts/` folders
 
-| Generated File Statistic | Value |
-| --- | ---: |
-| Number of generated files | `148` |
-| Mean sample size | `35983.67` |
-| Std sample size | `41342.19` |
-| Min sample size | `10048` |
-| Max sample size | `101440` |
-| Mean `inside_theta_count` | `203.43` |
-| Std `inside_theta_count` | `652.82` |
-| Max `inside_theta_count` | `3604` |
-| Mean `inside_theta_fraction` | `0.006648` |
-| Std `inside_theta_fraction` | `0.021646` |
-| Max `inside_theta_fraction` | `0.194945` |
+These outputs are generally not intended to be committed unless explicitly needed.
 
-## How Theta Values Are Assigned
+## Environment
 
-Let:
-
-- `n` = number of LF blocks
-- `m` = number of HF training blocks
-- `k` = number of HF validation blocks
-
-Then:
-
-- sample `n` LF theta values from the LF support
-- choose `m` of those LF theta values for the HF training blocks
-- sample `k` separate validation theta values for the HF validation blocks
-
-This preserves the important rule:
-
-- every HF theta is also present in LF
-
-while keeping the HF validation theta set separate from the training theta set.
-
-## What Each Output File Contains
-
-Each LF/HF/validation block file contains:
-
-- the sampled event rows from that block
-- original event columns
-- `r`
-- `s_r`
-- `z_from_center`
-- `s_z_from_center`
-- `source_component`
-- `source_file`
-- theta metadata:
-  - `R_max`
-  - `Z_max`
-  - `split_name`
-  - `fidelity`
-- `inside_theta`
-
-where:
-
-- `inside_theta = 1` if the event is inside the centered theta region
-- `inside_theta = 0` otherwise
-
-## Code Layout
-
-- [`prepare_resum_data.py`](prepare_resum_data.py): runnable entrypoint, config loading, pool/block pipeline, and summary printing
-- [`convert_csv_to_h5_xlzd.py`](convert_csv_to_h5_xlzd.py): converts per-theta CSV/parquet files into HDF5 files for the CNP
-- [`xlzd_resum/config.py`](xlzd_resum/config.py): config dataclasses
-- [`xlzd_resum/io_utils.py`](xlzd_resum/io_utils.py): robust input loading and saving
-- [`xlzd_resum/theta.py`](xlzd_resum/theta.py): centered theta definitions and `z_from_center` logic
-- [`xlzd_resum/dataset.py`](xlzd_resum/dataset.py): pool splitting, block splitting, theta assignment, and file writing
-- [`config/pipeline_config.json`](config/pipeline_config.json): main config
-- [`config/pipeline_config_smoke.json`](config/pipeline_config_smoke.json): smoke-test config
-- [`src/xlzd/settings.yaml`](src/xlzd/settings.yaml): main RESuM/CNP/MFGP settings for training LF + training HF
-- [`src/xlzd/settings_validation.yaml`](src/xlzd/settings_validation.yaml): CNP prediction settings for held-out HF validation files
-- [`src/run_cnp/cnp_clean_pipeline.py`](src/run_cnp/cnp_clean_pipeline.py): self-contained CNP train/predict pipeline
-- [`src/run_cnp/cnp_xlzd_workflow.ipynb`](src/run_cnp/cnp_xlzd_workflow.ipynb): CNP-only notebook for training, prediction, and inline visualization
-- [`src/run_cnp/cnp_predict_per_signal.py`](src/run_cnp/cnp_predict_per_signal.py): optional per-event CNP export
-- [`src/run_cnp/preprocess_mixup_xlzd.py`](src/run_cnp/preprocess_mixup_xlzd.py): optional mixup preprocessing on H5 training files
-- [`src/run_mfgp/mfgp_clean_pipeline.py`](src/run_mfgp/mfgp_clean_pipeline.py): clean MF-GP fit/inference from CNP output CSVs
-- [`src/run_mfgp/mfgp_xlzd_workflow.ipynb`](src/run_mfgp/mfgp_xlzd_workflow.ipynb): MF-GP notebook for fitting, inference, and inline visualization
-- [`requirements.txt`](requirements.txt): minimal Python dependencies
-
-## Install
+Install dependencies with:
 
 ```bash
 python3 -m venv .venv
@@ -243,201 +181,24 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## How To Run
+## Suggested Entry Points
 
-Prepare the theta files:
+If you are new to the repo, start here:
 
-```bash
-python3 prepare_resum_data.py
-```
+1. [`prepare_resum_data.py`](prepare_resum_data.py)
+2. [`convert_csv_to_h5_xlzd.py`](convert_csv_to_h5_xlzd.py)
+3. [`src/run_cnp/cnp_xlzd_workflow.ipynb`](src/run_cnp/cnp_xlzd_workflow.ipynb)
+4. [`src/run_mfgp/mfgp_xlzd_workflow.ipynb`](src/run_mfgp/mfgp_xlzd_workflow.ipynb)
 
-Convert the generated per-theta files to HDF5 for the CNP:
+If you are working on shell theta, start here:
 
-```bash
-python3 convert_csv_to_h5_xlzd.py
-```
+1. [`xlzd_shell_theta/prepare_shell_theta_data.py`](xlzd_shell_theta/prepare_shell_theta_data.py)
+2. [`xlzd_shell_theta/convert_shell_theta_to_h5.py`](xlzd_shell_theta/convert_shell_theta_to_h5.py)
+3. [`xlzd_shell_theta/00_shell_theta_cnp_workflow.ipynb`](xlzd_shell_theta/00_shell_theta_cnp_workflow.ipynb)
+4. [`xlzd_shell_theta/01_shell_theta_mfgp.ipynb`](xlzd_shell_theta/01_shell_theta_mfgp.ipynb)
 
-Train the CNP on LF and predict on LF+HF training files:
+## Notes
 
-```bash
-python3 src/run_cnp/cnp_clean_pipeline.py
-```
-
-Or run the CNP-only notebook:
-
-- open [`src/run_cnp/cnp_xlzd_workflow.ipynb`](src/run_cnp/cnp_xlzd_workflow.ipynb)
-- execute the cells in order after the H5 conversion step is complete
-
-Run CNP prediction on the held-out HF validation files with the trained model:
-
-```bash
-python3 src/run_cnp/cnp_validation_prediction.py
-```
-
-Fit the MF-GP using the CNP output from training LF+HF:
-
-```bash
-python3 src/run_mfgp/mfgp_clean_pipeline.py --config src/xlzd/settings.yaml
-```
-
-Or run the MF-GP notebook:
-
-- open [`src/run_mfgp/mfgp_xlzd_workflow.ipynb`](src/run_mfgp/mfgp_xlzd_workflow.ipynb)
-- execute the cells in order after the CNP outputs are available in `data/out/cnp`
-
-Smoke test for the data-preparation stage:
-
-```bash
-python3 prepare_resum_data.py --config config/pipeline_config_smoke.json
-```
-
-## RESuM Mapping
-
-The XLZD RESuM interface used here is:
-
-| RESuM quantity | XLZD columns |
-| --- | --- |
-| `theta` | `["R_max", "Z_max"]` |
-| `phi` | `["s_r", "s_z_from_center"]` |
-| target | `["inside_theta"]` |
-| LF files | `outputs/training/lf/*.csv` then `.h5` |
-| HF files | `outputs/training/hf/*.csv` then `.h5` |
-| validation files | `outputs/validation/hf/*.csv` then `.h5` |
-
-Each theta file contains all events from one block. The CNP sees:
-
-- global configuration: `theta = (R_max, Z_max)`
-- event-specific features: `phi = (s_r, s_z_from_center)`
-- binary target: `inside_theta`, defined from the final position
-
-The MF-GP then operates on the aggregated CNP output CSV where each row is one theta/fidelity configuration.
-
-## Main Config Fields
-
-Edit [`config/pipeline_config.json`](config/pipeline_config.json).
-
-Most important fields:
-
-- `file_load.input_dir`
-- `file_load.max_rows_per_file`
-- `split.lf_pool_fraction`
-- `split.hf_pool_fraction`
-- `split.random_seed`
-- `theta.z_center`
-- `theta.z_lower`, `theta.z_upper`
-- `theta.r_lower`, `theta.r_upper`
-- `theta.min_z_width`, `theta.min_r_width`
-- `sampling.lf_block_size`
-- `sampling.hf_block_size`
-- `sampling.validation_block_size`
-- `output.output_dir`
-- `output.output_format`
-
-## Progress During Run
-
-The script prints stage-level progress with elapsed time for:
-
-- file loading and normalization
-- centered-z computation
-- disjoint pool splitting
-- equal-size block splitting
-- theta generation
-- LF block writing
-- HF training block writing
-- HF validation block writing
-- output writing
-
-It also shows progress bars for writing the LF, HF training, and HF validation block files.
-
-## Outputs
-
-The script writes:
-
-- `processed_all_events.csv` or `.parquet`
-- `lf_training_pool.csv` or `.parquet`
-- `hf_training_pool.csv` or `.parquet`
-- `hf_validation_pool.csv` or `.parquet`
-- `training/lf/*.csv` or `.parquet`
-- `training/hf/*.csv` or `.parquet`
-- `validation/hf/*.csv` or `.parquet`
-- `theta_file_manifest.csv` or `.parquet`
-
-### Pool Files
-
-These contain the disjoint raw-event pools:
-
-- `lf_training_pool`
-- `hf_training_pool`
-- `hf_validation_pool`
-
-### Per-Block Files
-
-These are the per-theta block files:
-
-- `training/lf/`
-- `training/hf/`
-- `validation/hf/`
-
-Filename style:
-
-- `lf_R123p456_Z789p000.csv`
-- `hf_R123p456_Z789p000.csv`
-
-### Manifest
-
-The manifest has one row per generated block file and includes:
-
-- `block_index`
-- `random_seed_used`
-- `split_name`
-- `fidelity`
-- `file_name`
-- `file_path`
-- `sample_size`
-- `R_max`
-- `Z_max`
-- `inside_theta_count`
-- `inside_theta_fraction`
-
-## Assumptions And Places To Modify
-
-### File parsing assumptions
-
-- the first column is preserved as `global_event_id`
-- the remaining 8 physics columns are parsed as numeric
-- malformed rows are dropped with a warning instead of aborting the entire run
-
-### Changing pool proportions
-
-Edit:
-
-- `split.lf_pool_fraction`
-- `split.hf_pool_fraction`
-
-The validation pool is the remainder.
-
-### Changing block sizes
-
-Edit:
-
-- `sampling.lf_block_size`
-- `sampling.hf_block_size`
-- `sampling.validation_block_size`
-
-### Changing centered theta behavior
-
-Edit:
-
-- `theta.z_center` if you want to force a chamber center
-- `theta.z_lower`, `theta.z_upper`
-- `theta.r_lower`, `theta.r_upper`
-
-### Per-component processing
-
-The code still preserves `source_component`.
-
-If you later want to run the same pool/block logic separately per component:
-
-- start from `load_event_collection(...)`
-- loop over `loaded.per_component.items()`
-- run the same pool/block pipeline separately on each component dataframe
+- The standard cumulative-theta workflow and the shell-theta workflow are different experiments and should not be mixed.
+- The notebooks under `src/run_cnp/additional_experiments/` are archived variants, not the main entry points.
+- The LF augmentation and theta augmentation folders are exploratory branches rather than the default pipeline.

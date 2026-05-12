@@ -9,19 +9,19 @@ cnp_settings:
   batch_size_predict: [20000, 120000]
   files_per_batch_predict: 1
   number_of_walkers: 1
-  config_wise: False
-  use_data_augmentation: False
+  config_wise: false
+  use_data_augmentation: false
   use_beta: [0.1, 0.1]
   signal_to_background_ratio: ""
   ratio_testing_vs_training: 1/10
   plot_after: 5000
 
 simulation_settings:
-  theta_headers: ["R_max", "Z_max"]
+  theta_headers: ["r_shell", "z_shell"]
   phi_labels: ["s_r", "s_z_from_center"]
-  target_headers: ["inside_theta"]
+  target_headers: ["near_shell"]
   target_range: [0, 1]
-  signal_condition: ["inside_theta==1"]
+  signal_condition: ["near_shell==1"]
   weights_labels: ["weights"]
   theta_min: [0.0, 0.0]
   theta_max: [1500.0, 2000.0]
@@ -30,18 +30,18 @@ simulation_settings:
   hf_cost: 10
 
 path_settings:
-  version: xlzd_v1
+  version: xlzd_shell_v1_minibatch
 
-  path_to_files_train: ../../outputs/training/lf
+  path_to_files_train: ../outputs_shell_theta/training/lf
 
   path_to_files_predict:
-    - ../../outputs/validation/hf
+    - ../outputs_shell_theta/validation/hf
 
   iteration: [0]
   fidelity: [1]
 
-  path_to_files_validation: ../../data/out/cnp/cnp_xlzd_v1_output_validation_15epochs.csv
+  path_to_files_validation: ../data/out/cnp/cnp_xlzd_shell_v1_minibatch_output_validation_15epochs.csv
 
-  path_out_cnp: ../../data/out/cnp
-  path_out_mfgp: ../../data/out/mfgp
-  path_out_pce: ../../data/out/pce
+  path_out_cnp: ../data/out/cnp
+  path_out_mfgp: ../data/out/mfgp
+  path_out_pce: ../data/out/pce

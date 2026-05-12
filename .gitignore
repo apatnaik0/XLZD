@@ -15,6 +15,12 @@ outputs_smoke/**
 !outputs_smoke/**/
 !outputs_smoke/**/.gitkeep
 
+# Depth penetration HTML artifacts
+depth_penetration_experiments/artifacts/**
+!depth_penetration_experiments/artifacts/.gitkeep
+lf_augmentations/artifacts/**
+!lf_augmentations/artifacts/.gitkeep
+
 # Python cache / build artifacts
 __pycache__/
 *.py[cod]

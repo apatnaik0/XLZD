@@ -319,12 +319,23 @@ class MFGPResult:
     data_plot: Optional[Path]
     parity_plot: Optional[Path]
     mean_std_plot: Path
+    mean_std_plot_3d_html: Optional[Path]
     residual_plot: Optional[Path]
     theta_group_plot_dir: Optional[Path]
     across_theta_plot: Optional[Path]
     across_theta_zoom_plot: Optional[Path]
     coverage_plot: Optional[Path]
     validation_parity_plot: Optional[Path]
+    train_across_theta_linear_plot: Optional[Path]
+    train_across_theta_log_linear_sigma_plot: Optional[Path]
+    train_across_theta_log_log_sigma_plot: Optional[Path]
+    validation_across_theta_linear_plot: Optional[Path]
+    validation_across_theta_log_linear_sigma_plot: Optional[Path]
+    validation_across_theta_log_log_sigma_plot: Optional[Path]
+    train_parity_linear_plot: Optional[Path]
+    train_parity_log_plot: Optional[Path]
+    validation_parity_linear_plot: Optional[Path]
+    validation_parity_log_plot: Optional[Path]
 
 
 def _grid_from_bounds(theta_min: Sequence[float], theta_max: Sequence[float], n: int = 120) -> np.ndarray:
@@ -367,7 +378,92 @@ def _plot_hf_observation_map(hf: pd.DataFrame, x_cols: Sequence[str], out_path: 
     plt.close(fig)
 
 
+def _choose_log_plot_eps(*arrays: np.ndarray) -> float:
+    positives: List[np.ndarray] = []
+    for arr in arrays:
+        a = np.asarray(arr, dtype=float)
+        if a.size == 0:
+            continue
+        pos = a[np.isfinite(a) & (a > 0)]
+        if pos.size:
+            positives.append(pos)
+    if positives:
+        min_pos = float(min(np.min(pos) for pos in positives))
+        return max(min_pos * 0.5, 1e-12)
+    return 1e-12
+
+
+def _safe_log10(values: np.ndarray, eps: float) -> np.ndarray:
+    return np.log10(np.maximum(np.asarray(values, dtype=float), float(eps)))
+
+
+def _log_sigma_from_linear(mu: np.ndarray, sigma: np.ndarray, eps: float) -> np.ndarray:
+    mu_safe = np.maximum(np.asarray(mu, dtype=float), float(eps))
+    sigma_arr = np.maximum(np.asarray(sigma, dtype=float), 1e-12)
+    return sigma_arr / (mu_safe * np.log(10.0))
+
+
+def _target_transform_suffix(target_transform: str) -> str:
+    mode = str(target_transform).strip().lower()
+    if mode not in {"linear", "log_hf", "log_lf", "log_both"}:
+        raise ValueError(
+            f"Unsupported target_transform={target_transform!r}. "
+            "Expected one of: linear, log_hf, log_lf, log_both."
+        )
+    return mode
+
+
+def _transform_mfgp_targets(
+    y_lf: np.ndarray,
+    y_hf: np.ndarray,
+    target_transform: str,
+    eps: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, float, bool, bool]:
+    mode = _target_transform_suffix(target_transform)
+    y_lf = np.asarray(y_lf, dtype=float)
+    y_hf = np.asarray(y_hf, dtype=float)
+    use_log_lf = mode in {"log_lf", "log_both"}
+    use_log_hf = mode in {"log_hf", "log_both"}
+    eps_val = float(eps) if eps is not None else _choose_log_plot_eps(y_lf, y_hf)
+
+    out_lf = _safe_log10(y_lf, eps_val) if use_log_lf else y_lf.copy()
+    out_hf = _safe_log10(y_hf, eps_val) if use_log_hf else y_hf.copy()
+    return out_lf, out_hf, eps_val, use_log_lf, use_log_hf
+
+
+def _transform_series_for_mode(values: np.ndarray, use_log: bool, eps: float) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    return _safe_log10(arr, eps) if use_log else arr
+
+
 def _plot_parity(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray, out_path: Path) -> None:
+    eps = _choose_log_plot_eps(y_true, y_pred, y_pred - y_std, y_pred + y_std)
+    y_true_log = _safe_log10(y_true, eps)
+    y_pred_log = _safe_log10(y_pred, eps)
+    y_lower_log = _safe_log10(y_pred - y_std, eps)
+    y_upper_log = _safe_log10(y_pred + y_std, eps)
+    yerr_log = np.vstack(
+        [
+            np.maximum(y_pred_log - y_lower_log, 0.0),
+            np.maximum(y_upper_log - y_pred_log, 0.0),
+        ]
+    )
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.errorbar(y_true_log, y_pred_log, yerr=yerr_log, fmt="o", ms=4, alpha=0.6, capsize=2, color="tab:blue")
+    lo = float(min(np.min(y_true_log), np.min(y_pred_log)))
+    hi = float(max(np.max(y_true_log), np.max(y_pred_log)))
+    ax.plot([lo, hi], [lo, hi], "k--", lw=1)
+    ax.set_xlabel(f"log10(HF truth y_raw, floor={eps:.2e})")
+    ax.set_ylabel("log10(MF-GP prediction)")
+    ax.set_title("HF Parity Plot (Log Scale)")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+
+
+def _plot_parity_linear(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray, out_path: Path, title: str) -> None:
     fig, ax = plt.subplots(1, 1, figsize=(6, 6))
     ax.errorbar(y_true, y_pred, yerr=y_std, fmt="o", ms=4, alpha=0.6, capsize=2, color="tab:blue")
     lo = float(min(np.min(y_true), np.min(y_pred)))
@@ -375,7 +471,34 @@ def _plot_parity(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray, out_
     ax.plot([lo, hi], [lo, hi], "k--", lw=1)
     ax.set_xlabel("HF truth (y_raw)")
     ax.set_ylabel("MF-GP prediction")
-    ax.set_title("HF Parity Plot")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+
+
+def _plot_parity_log(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray, out_path: Path, title: str) -> None:
+    eps = _choose_log_plot_eps(y_true, y_pred, y_pred - y_std, y_pred + y_std)
+    y_true_log = _safe_log10(y_true, eps)
+    y_pred_log = _safe_log10(y_pred, eps)
+    y_lower_log = _safe_log10(y_pred - y_std, eps)
+    y_upper_log = _safe_log10(y_pred + y_std, eps)
+    yerr_log = np.vstack(
+        [
+            np.maximum(y_pred_log - y_lower_log, 0.0),
+            np.maximum(y_upper_log - y_pred_log, 0.0),
+        ]
+    )
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.errorbar(y_true_log, y_pred_log, yerr=yerr_log, fmt="o", ms=4, alpha=0.6, capsize=2, color="tab:blue")
+    lo = float(min(np.min(y_true_log), np.min(y_pred_log)))
+    hi = float(max(np.max(y_true_log), np.max(y_pred_log)))
+    ax.plot([lo, hi], [lo, hi], "k--", lw=1)
+    ax.set_xlabel(f"log10(HF truth y_raw, floor={eps:.2e})")
+    ax.set_ylabel("log10(MF-GP prediction)")
+    ax.set_title(title)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=170)
@@ -396,13 +519,44 @@ def _plot_mean_std_heatmaps(
     Zm = mean_hf.reshape(ny, nx)
     Zs = std_hf.reshape(ny, nx)
 
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    # Visualization only: mirror centered theta extents into four quadrants so
+    # detector-symmetric structure is easier to inspect.
+    gx_plot = np.unique(np.concatenate([-gx, gx]))
+    gy_plot = np.unique(np.concatenate([-gy, gy]))
 
-    im1 = ax[0].contourf(gx, gy, Zm, levels=24, cmap="viridis")
-    if hf_points is not None and len(hf_points):
+    def _mirror_surface(z_base: np.ndarray) -> np.ndarray:
+        z_plot = np.empty((len(gy_plot), len(gx_plot)), dtype=float)
+        for iy, yv in enumerate(gy_plot):
+            src_y = int(np.argmin(np.abs(gy - abs(float(yv)))))
+            for ix, xv in enumerate(gx_plot):
+                src_x = int(np.argmin(np.abs(gx - abs(float(xv)))))
+                z_plot[iy, ix] = z_base[src_y, src_x]
+        return z_plot
+
+    def _mirror_points(points: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if points is None or len(points) == 0:
+            return None
+        points = np.asarray(points, dtype=float)
+        mirrored = []
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                q = points.copy()
+                q[:, 0] *= sx
+                q[:, 1] *= sy
+                mirrored.append(q)
+        return np.vstack(mirrored)
+
+    Zm_plot = _mirror_surface(Zm)
+    Zs_plot = _mirror_surface(Zs)
+    hf_points_plot = _mirror_points(hf_points)
+
+    fig, ax = plt.subplots(1, 2, figsize=(18, 8))
+
+    im1 = ax[0].contourf(gx_plot, gy_plot, Zm_plot, levels=24, cmap="viridis")
+    if hf_points_plot is not None and len(hf_points_plot):
         ax[0].scatter(
-            hf_points[:, 0],
-            hf_points[:, 1],
+            hf_points_plot[:, 0],
+            hf_points_plot[:, 1],
             s=32,
             c="white",
             edgecolor="black",
@@ -410,18 +564,20 @@ def _plot_mean_std_heatmaps(
             alpha=0.95,
             label="HF points",
         )
-    ax[0].set_title("MF-GP Mean (HF)")
-    ax[0].set_xlabel(x_cols[0])
-    ax[0].set_ylabel(x_cols[1])
+    ax[0].axvline(0.0, color="white", lw=0.8, alpha=0.55)
+    ax[0].axhline(0.0, color="white", lw=0.8, alpha=0.55)
+    ax[0].set_title("4-Fold MF-GP Mean (HF)")
+    ax[0].set_xlabel(f"signed {x_cols[0]} mirror")
+    ax[0].set_ylabel(f"signed {x_cols[1]} mirror")
     plt.colorbar(im1, ax=ax[0], label="mean")
-    if hf_points is not None and len(hf_points):
+    if hf_points_plot is not None and len(hf_points_plot):
         ax[0].legend(loc="best", fontsize=8, frameon=True)
 
-    im2 = ax[1].contourf(gx, gy, Zs, levels=24, cmap="Reds")
-    if hf_points is not None and len(hf_points):
+    im2 = ax[1].contourf(gx_plot, gy_plot, Zs_plot, levels=24, cmap="Reds")
+    if hf_points_plot is not None and len(hf_points_plot):
         ax[1].scatter(
-            hf_points[:, 0],
-            hf_points[:, 1],
+            hf_points_plot[:, 0],
+            hf_points_plot[:, 1],
             s=32,
             c="white",
             edgecolor="black",
@@ -429,16 +585,170 @@ def _plot_mean_std_heatmaps(
             alpha=0.95,
             label="HF points",
         )
-    ax[1].set_title("MF-GP Std (HF)")
-    ax[1].set_xlabel(x_cols[0])
-    ax[1].set_ylabel(x_cols[1])
+    ax[1].axvline(0.0, color="white", lw=0.8, alpha=0.55)
+    ax[1].axhline(0.0, color="white", lw=0.8, alpha=0.55)
+    ax[1].set_title("4-Fold MF-GP Std (HF)")
+    ax[1].set_xlabel(f"signed {x_cols[0]} mirror")
+    ax[1].set_ylabel(f"signed {x_cols[1]} mirror")
     plt.colorbar(im2, ax=ax[1], label="std")
-    if hf_points is not None and len(hf_points):
+    if hf_points_plot is not None and len(hf_points_plot):
         ax[1].legend(loc="best", fontsize=8, frameon=True)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
+
+
+def _write_interactive_mean_std_surfaces_3d_html(
+    grid_xy: np.ndarray,
+    mean_hf: np.ndarray,
+    std_hf: np.ndarray,
+    x_cols: Sequence[str],
+    hf_points: Optional[np.ndarray],
+    hf_mean_values: Optional[np.ndarray],
+    hf_std_values: Optional[np.ndarray],
+    out_path: Path,
+) -> bool:
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except Exception:
+        return False
+
+    gx = np.unique(grid_xy[:, 0])
+    gy = np.unique(grid_xy[:, 1])
+    nx, ny = len(gx), len(gy)
+    Zm = mean_hf.reshape(ny, nx)
+    Zs = std_hf.reshape(ny, nx)
+
+    # Visualization only: mirror centered theta extents into four quadrants.
+    gx_plot = np.unique(np.concatenate([-gx, gx]))
+    gy_plot = np.unique(np.concatenate([-gy, gy]))
+    X, Y = np.meshgrid(gx_plot, gy_plot, indexing="xy")
+
+    def _mirror_surface(z_base: np.ndarray) -> np.ndarray:
+        z_plot = np.empty((len(gy_plot), len(gx_plot)), dtype=float)
+        for iy, yv in enumerate(gy_plot):
+            src_y = int(np.argmin(np.abs(gy - abs(float(yv)))))
+            for ix, xv in enumerate(gx_plot):
+                src_x = int(np.argmin(np.abs(gx - abs(float(xv)))))
+                z_plot[iy, ix] = z_base[src_y, src_x]
+        return z_plot
+
+    def _mirror_points(points: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if points is None or len(points) == 0:
+            return None
+        points = np.asarray(points, dtype=float)
+        mirrored = []
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                q = points.copy()
+                q[:, 0] *= sx
+                q[:, 1] *= sy
+                mirrored.append(q)
+        return np.vstack(mirrored)
+
+    def _mirror_values(values: Optional[np.ndarray], n_points: int) -> Optional[np.ndarray]:
+        if values is None:
+            return None
+        values = np.asarray(values, dtype=float).reshape(-1)
+        if len(values) != n_points:
+            return values
+        return np.tile(values, 4)
+
+    Zm_plot = _mirror_surface(Zm)
+    Zs_plot = _mirror_surface(Zs)
+    hf_points_plot = _mirror_points(hf_points)
+    n_hf_points = 0 if hf_points is None else len(hf_points)
+    hf_mean_values_plot = _mirror_values(hf_mean_values, n_hf_points)
+    hf_std_values_plot = _mirror_values(hf_std_values, n_hf_points)
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        specs=[[{"type": "scene"}, {"type": "scene"}]],
+        subplot_titles=("MF-GP Mean Surface (HF)", "MF-GP Std Surface (HF)"),
+        horizontal_spacing=0.04,
+    )
+
+    fig.add_trace(
+        go.Surface(
+            x=X,
+            y=Y,
+            z=Zm_plot,
+            colorscale="Viridis",
+            opacity=0.88,
+            contours={
+                "z": {"show": True, "usecolormap": True, "project_z": True, "highlightwidth": 1},
+            },
+            name="Mean surface",
+            showscale=True,
+            colorbar={"title": "mean", "x": 0.46},
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Surface(
+            x=X,
+            y=Y,
+            z=Zs_plot,
+            colorscale="Reds",
+            opacity=0.88,
+            contours={
+                "z": {"show": True, "usecolormap": True, "project_z": True, "highlightwidth": 1},
+            },
+            name="Std surface",
+            showscale=True,
+            colorbar={"title": "std", "x": 1.02},
+        ),
+        row=1,
+        col=2,
+    )
+
+    if hf_points_plot is not None and len(hf_points_plot):
+        z_mean = np.asarray(
+            hf_mean_values_plot if hf_mean_values_plot is not None else np.zeros(len(hf_points_plot)),
+            dtype=float,
+        )
+        z_std = np.asarray(
+            hf_std_values_plot if hf_std_values_plot is not None else np.zeros(len(hf_points_plot)),
+            dtype=float,
+        )
+        scatter_style = dict(
+            mode="markers",
+            marker={"size": 4, "color": "white", "line": {"color": "black", "width": 1}},
+            name="HF theta points",
+            showlegend=False,
+        )
+        fig.add_trace(
+            go.Scatter3d(x=hf_points_plot[:, 0], y=hf_points_plot[:, 1], z=z_mean, **scatter_style),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter3d(x=hf_points_plot[:, 0], y=hf_points_plot[:, 1], z=z_std, **scatter_style),
+            row=1,
+            col=2,
+        )
+
+    scene_common = dict(
+        xaxis_title=x_cols[0],
+        yaxis_title=x_cols[1],
+        aspectmode="cube",
+        camera={"eye": {"x": 1.7, "y": 1.5, "z": 1.1}},
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=950,
+        width=1800,
+        margin=dict(l=10, r=10, t=60, b=10),
+        scene={**scene_common, "zaxis_title": "mean"},
+        scene2={**scene_common, "zaxis_title": "std"},
+        title="Interactive 4-Fold MF-GP Mean / Std Surfaces with Mirrored HF Theta Points",
+    )
+    fig.write_html(out_path, include_plotlyjs="cdn")
+    return True
 
 
 def _plot_residual_heatmap(
@@ -499,6 +809,7 @@ def _plot_theta_group_uncertainty_bands(
     theta_headers: Sequence[str],
     model: "CleanAutoregressiveMFGP",
     out_dir: Path,
+    band_mode: str = "linear_sigma",
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     thx, thy = theta_headers[0], theta_headers[1]
@@ -519,10 +830,13 @@ def _plot_theta_group_uncertainty_bands(
         if not np.isfinite(std) or std < 0:
             std = 0.0
         idx = np.arange(len(y_true), dtype=int)
+        eps = _choose_log_plot_eps(y_true, np.array([mu]), np.array([mu - 3 * std]), np.array([mu + 3 * std]))
+        y_true_log = _safe_log10(y_true, eps)
+        mu_log = float(_safe_log10(np.array([mu]), eps)[0])
 
         fig, ax = plt.subplots(1, 1, figsize=(8, 4))
-        ax.plot(idx, y_true, "o", ms=3.5, alpha=0.7, label="validation y_raw")
-        ax.axhline(mu, color="tab:red", lw=1.5, label="MF-GP mean")
+        ax.plot(idx, y_true_log, "o", ms=3.5, alpha=0.7, label="validation log10(y_raw)")
+        ax.axhline(mu_log, color="tab:red", lw=1.5, label="MF-GP mean (log10)")
         # Use true model std for both statistics and rendered bands.
         std_true = max(std, 1e-12)
         err = np.abs(y_true - mu)
@@ -534,24 +848,56 @@ def _plot_theta_group_uncertainty_bands(
         y_raw_std = float(np.std(y_true))
 
         # Render bands using axhspan to guarantee drawing even for tiny/degenerate x ranges.
-        ax.axhspan(mu - 3 * std_true, mu + 3 * std_true, color="tab:purple", alpha=0.10, label="3σ band")
-        ax.axhspan(mu - 2 * std_true, mu + 2 * std_true, color="tab:orange", alpha=0.18, label="2σ band")
-        ax.axhspan(mu - 1 * std_true, mu + 1 * std_true, color="tab:red", alpha=0.30, label="1σ band")
+        sigma_log = float(_log_sigma_from_linear(np.array([mu]), np.array([std_true]), eps)[0])
+        if band_mode == "log_sigma":
+            mode_title = "Log-σ Bands"
+            mean_for_lines = mu_log
+            band_label_suffix = "log-σ"
+        else:
+            mode_title = "Linear-σ Bands"
+            mean_for_lines = mu_log
+            band_label_suffix = "linear-σ"
+        for k, color, alpha, label in [
+            (3, "tab:purple", 0.10, f"3σ band ({band_label_suffix})"),
+            (2, "tab:orange", 0.18, f"2σ band ({band_label_suffix})"),
+            (1, "tab:red", 0.30, f"1σ band ({band_label_suffix})"),
+        ]:
+            if band_mode == "log_sigma":
+                lo = mean_for_lines - k * sigma_log
+                hi = mean_for_lines + k * sigma_log
+            else:
+                lo = float(_safe_log10(np.array([mu - k * std_true]), eps)[0])
+                hi = float(_safe_log10(np.array([mu + k * std_true]), eps)[0])
+            ax.axhspan(lo, hi, color=color, alpha=alpha, label=label)
         # Draw boundary lines explicitly so band edges are always visible.
         for k, color in [(1, "tab:red"), (2, "tab:orange"), (3, "tab:purple")]:
-            ax.axhline(mu + k * std_true, color=color, lw=0.8, alpha=0.9)
-            ax.axhline(mu - k * std_true, color=color, lw=0.8, alpha=0.9)
-        ax.set_title(f"Theta ({thx}={xv}, {thy}={yv})")
+            if band_mode == "log_sigma":
+                hi = mean_for_lines + k * sigma_log
+                lo = mean_for_lines - k * sigma_log
+            else:
+                hi = float(_safe_log10(np.array([mu + k * std_true]), eps)[0])
+                lo = float(_safe_log10(np.array([mu - k * std_true]), eps)[0])
+            ax.axhline(hi, color=color, lw=0.8, alpha=0.9)
+            ax.axhline(lo, color=color, lw=0.8, alpha=0.9)
+        ax.set_title(f"Theta ({thx}={xv}, {thy}={yv}) | Log Scale | {mode_title}")
         ax.set_xlabel("Sample index")
-        ax.set_ylabel("y_raw")
+        ax.set_ylabel(f"log10(y_raw, floor={eps:.2e})")
         # Mild zoom-in around the main mass while keeping uncertainty region in view.
         if n >= 5:
-            q_lo, q_hi = np.quantile(y_true, [0.02, 0.98])
-            y_lo = float(min(q_lo, mu - 3 * std_true))
-            y_hi = float(max(q_hi, mu + 3 * std_true))
+            q_lo, q_hi = np.quantile(y_true_log, [0.02, 0.98])
+            if band_mode == "log_sigma":
+                y_lo = float(min(q_lo, mean_for_lines - 3 * sigma_log))
+                y_hi = float(max(q_hi, mean_for_lines + 3 * sigma_log))
+            else:
+                y_lo = float(min(q_lo, _safe_log10(np.array([mu - 3 * std_true]), eps)[0]))
+                y_hi = float(max(q_hi, _safe_log10(np.array([mu + 3 * std_true]), eps)[0]))
         else:
-            y_lo = float(min(np.min(y_true), mu - 3 * std_true))
-            y_hi = float(max(np.max(y_true), mu + 3 * std_true))
+            if band_mode == "log_sigma":
+                y_lo = float(min(np.min(y_true_log), mean_for_lines - 3 * sigma_log))
+                y_hi = float(max(np.max(y_true_log), mean_for_lines + 3 * sigma_log))
+            else:
+                y_lo = float(min(np.min(y_true_log), _safe_log10(np.array([mu - 3 * std_true]), eps)[0]))
+                y_hi = float(max(np.max(y_true_log), _safe_log10(np.array([mu + 3 * std_true]), eps)[0]))
         y_span = max(y_hi - y_lo, 1e-9)
         ax.set_ylim(y_lo - 0.10 * y_span, y_hi + 0.10 * y_span)
         ax.grid(True, alpha=0.3)
@@ -562,6 +908,8 @@ def _plot_theta_group_uncertainty_bands(
             Line2D([0], [0], color="none", label=f"y_raw std: {y_raw_std:.6g}"),
             Line2D([0], [0], color="none", label=f"model mean: {mu:.6g}"),
             Line2D([0], [0], color="none", label=f"model std: {std_true:.6g}"),
+            Line2D([0], [0], color="none", label=f"log std approx: {sigma_log:.6g}"),
+            Line2D([0], [0], color="none", label=f"log floor: {eps:.2e}"),
             Line2D([0], [0], color="none", label=f"within 1σ: {c1}/{n}"),
             Line2D([0], [0], color="none", label=f"within 2σ: {c2}/{n}"),
             Line2D([0], [0], color="none", label=f"within 3σ: {c3}/{n}"),
@@ -569,7 +917,8 @@ def _plot_theta_group_uncertainty_bands(
         handles, labels = ax.get_legend_handles_labels()
         ax.legend(handles + extra, labels + [h.get_label() for h in extra], loc="best", fontsize=8, frameon=True)
         fig.tight_layout()
-        f = out_dir / f"uncertainty_bands_theta_{int(round(float(xv)))}_{int(round(float(yv)))}.png"
+        mode_suffix = "log_sigma" if band_mode == "log_sigma" else "linear_sigma"
+        f = out_dir / f"uncertainty_bands_theta_{int(round(float(xv)))}_{int(round(float(yv)))}_{mode_suffix}.png"
         fig.savefig(f, dpi=170)
         plt.close(fig)
         count += 1
@@ -581,6 +930,7 @@ def _plot_across_thetas(
     theta_headers: Sequence[str],
     model: "CleanAutoregressiveMFGP",
     out_path: Path,
+    band_mode: str = "linear_sigma",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     thx, thy = theta_headers[0], theta_headers[1]
     agg = (
@@ -598,23 +948,39 @@ def _plot_across_thetas(
     y_std = std.astype(float)
     y_std_true = np.maximum(y_std, 1e-12)
     err = np.abs(y_true - y_pred)
+    eps = _choose_log_plot_eps(y_true, y_pred, y_pred - 3 * y_std_true, y_pred + 3 * y_std_true)
+    y_true_log = _safe_log10(y_true, eps)
+    y_pred_log = _safe_log10(y_pred, eps)
+    y_std_log = _log_sigma_from_linear(y_pred, y_std_true, eps)
     n = int(len(y_true))
     c1 = int(np.sum(err <= 1.0 * y_std_true))
     c2 = int(np.sum(err <= 2.0 * y_std_true))
     c3 = int(np.sum(err <= 3.0 * y_std_true))
 
     fig, ax = plt.subplots(1, 1, figsize=(max(10, 0.18 * len(idx)), 5))
-    ax.plot(idx, y_true, "o", ms=4, color="black", alpha=0.75, label="Validation y_raw mean")
-    ax.plot(idx, y_pred, "-", lw=1.5, color="tab:blue", label="MF-GP mean")
-    ax.fill_between(idx, y_pred - y_std_true, y_pred + y_std_true, color="tab:blue", alpha=0.24, label="1σ band")
-    ax.fill_between(idx, y_pred - 2 * y_std_true, y_pred + 2 * y_std_true, color="tab:orange", alpha=0.16, label="2σ band")
-    ax.fill_between(idx, y_pred - 3 * y_std_true, y_pred + 3 * y_std_true, color="tab:purple", alpha=0.10, label="3σ band")
+    ax.plot(idx, y_true_log, "o", ms=4, color="black", alpha=0.75, label="Validation log10(y_raw mean)")
+    ax.plot(idx, y_pred_log, "-", lw=1.5, color="tab:blue", label="MF-GP mean (log10)")
+    for k, color, alpha, label in [
+        (1, "tab:blue", 0.24, "1σ band"),
+        (2, "tab:orange", 0.16, "2σ band"),
+        (3, "tab:purple", 0.10, "3σ band"),
+    ]:
+        if band_mode == "log_sigma":
+            lo = y_pred_log - k * y_std_log
+            hi = y_pred_log + k * y_std_log
+        else:
+            lo = _safe_log10(y_pred - k * y_std_true, eps)
+            hi = _safe_log10(y_pred + k * y_std_true, eps)
+        ax.fill_between(idx, lo, hi, color=color, alpha=alpha, label=label)
     ax.set_xlabel(f"Theta index (sorted by {thx}, {thy})")
-    ax.set_ylabel("y")
-    ax.set_title("Validation Thetas: Mean y_raw vs MF-GP Prediction")
+    ax.set_ylabel(f"log10(y, floor={eps:.2e})")
+    title_suffix = "Log-σ Bands" if band_mode == "log_sigma" else "Linear-σ Bands"
+    ax.set_title(f"Validation Thetas: Mean y_raw vs MF-GP Prediction (Log Scale, {title_suffix})")
     ax.grid(True, alpha=0.3)
     extra = [
         Line2D([0], [0], color="none", label=f"n points: {n}"),
+        Line2D([0], [0], color="none", label=f"band mode: {band_mode}"),
+        Line2D([0], [0], color="none", label=f"log floor: {eps:.2e}"),
         Line2D([0], [0], color="none", label=f"within 1σ: {c1}/{n}"),
         Line2D([0], [0], color="none", label=f"within 2σ: {c2}/{n}"),
         Line2D([0], [0], color="none", label=f"within 3σ: {c3}/{n}"),
@@ -655,6 +1021,121 @@ def _plot_coverage_summary(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.nda
     plt.close(fig)
 
 
+def _aggregate_theta_predictions_from_df(
+    df: pd.DataFrame,
+    theta_headers: Sequence[str],
+) -> pd.DataFrame:
+    thx, thy = theta_headers[0], theta_headers[1]
+    need = {thx, thy, "y_raw", "mf_mean", "mf_std"}
+    missing = sorted(need - set(df.columns))
+    if missing:
+        raise ValueError(f"Missing required columns for theta aggregation: {missing}")
+    return (
+        df.groupby([thx, thy], as_index=False)
+        .agg(
+            y_true=("y_raw", "mean"),
+            y_pred=("mf_mean", "mean"),
+            y_std=("mf_std", "mean"),
+        )
+        .sort_values([thx, thy], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+
+def _aggregate_theta_predictions_from_model(
+    df: pd.DataFrame,
+    theta_headers: Sequence[str],
+    model: "CleanAutoregressiveMFGP",
+) -> pd.DataFrame:
+    thx, thy = theta_headers[0], theta_headers[1]
+    agg = (
+        df.groupby([thx, thy], as_index=False)
+        .agg(y_true=("y_raw", "mean"))
+        .sort_values([thx, thy], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    x_pred = agg[[thx, thy]].to_numpy(dtype=float)
+    mu, std, _, _ = model.predict(x_pred)
+    agg["y_pred"] = mu.astype(float)
+    agg["y_std"] = std.astype(float)
+    return agg
+
+
+def _plot_across_theta_series(
+    agg: pd.DataFrame,
+    out_path: Path,
+    title: str,
+    *,
+    y_mode: str = "linear",
+    band_mode: str = "linear_sigma",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    y_true = agg["y_true"].to_numpy(dtype=float)
+    y_pred = agg["y_pred"].to_numpy(dtype=float)
+    y_std = np.maximum(agg["y_std"].to_numpy(dtype=float), 1e-12)
+    idx = np.arange(len(agg), dtype=int)
+    err = np.abs(y_true - y_pred)
+    n = int(len(y_true))
+    c1 = int(np.sum(err <= 1.0 * y_std))
+    c2 = int(np.sum(err <= 2.0 * y_std))
+    c3 = int(np.sum(err <= 3.0 * y_std))
+
+    fig, ax = plt.subplots(1, 1, figsize=(max(10, 0.25 * max(1, len(idx))), 5))
+    if y_mode == "linear":
+        ax.plot(idx, y_true, "o", ms=4, color="black", alpha=0.75, label="HF y_raw mean")
+        ax.plot(idx, y_pred, "-", lw=1.5, color="tab:blue", label="MF-GP mean")
+        for k, color, alpha, label in [
+            (1, "tab:blue", 0.24, "1σ band"),
+            (2, "tab:orange", 0.16, "2σ band"),
+            (3, "tab:purple", 0.10, "3σ band"),
+        ]:
+            ax.fill_between(idx, y_pred - k * y_std, y_pred + k * y_std, color=color, alpha=alpha, label=label)
+        ax.set_ylabel("y")
+        extra = [
+            Line2D([0], [0], color="none", label=f"n points: {n}"),
+            Line2D([0], [0], color="none", label=f"within 1σ: {c1}/{n}"),
+            Line2D([0], [0], color="none", label=f"within 2σ: {c2}/{n}"),
+            Line2D([0], [0], color="none", label=f"within 3σ: {c3}/{n}"),
+        ]
+    else:
+        eps = _choose_log_plot_eps(y_true, y_pred, y_pred - 3 * y_std, y_pred + 3 * y_std)
+        y_true_plot = _safe_log10(y_true, eps)
+        y_pred_plot = _safe_log10(y_pred, eps)
+        y_std_log = _log_sigma_from_linear(y_pred, y_std, eps)
+        ax.plot(idx, y_true_plot, "o", ms=4, color="black", alpha=0.75, label="HF log10(y_raw mean)")
+        ax.plot(idx, y_pred_plot, "-", lw=1.5, color="tab:blue", label="MF-GP mean (log10)")
+        for k, color, alpha, label in [
+            (1, "tab:blue", 0.24, "1σ band"),
+            (2, "tab:orange", 0.16, "2σ band"),
+            (3, "tab:purple", 0.10, "3σ band"),
+        ]:
+            if band_mode == "log_sigma":
+                lo = y_pred_plot - k * y_std_log
+                hi = y_pred_plot + k * y_std_log
+            else:
+                lo = _safe_log10(y_pred - k * y_std, eps)
+                hi = _safe_log10(y_pred + k * y_std, eps)
+            ax.fill_between(idx, lo, hi, color=color, alpha=alpha, label=label)
+        ax.set_ylabel(f"log10(y, floor={eps:.2e})")
+        extra = [
+            Line2D([0], [0], color="none", label=f"n points: {n}"),
+            Line2D([0], [0], color="none", label=f"band mode: {band_mode}"),
+            Line2D([0], [0], color="none", label=f"log floor: {eps:.2e}"),
+            Line2D([0], [0], color="none", label=f"within 1σ: {c1}/{n}"),
+            Line2D([0], [0], color="none", label=f"within 2σ: {c2}/{n}"),
+            Line2D([0], [0], color="none", label=f"within 3σ: {c3}/{n}"),
+        ]
+
+    ax.set_xlabel("Theta index (sorted)")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles + extra, labels + [h.get_label() for h in extra], loc="best", fontsize=8, frameon=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return y_true, y_pred, y_std
+
+
 def run_clean_mfgp(
     config_path: str | Path,
     cnp_csv: Optional[str | Path] = None,
@@ -662,6 +1143,8 @@ def run_clean_mfgp(
     iteration: int = 0,
     lf_fidelity: int = 0,
     hf_fidelity: int = 1,
+    target_transform: str = "linear",
+    log_epsilon: Optional[float] = None,
     grid_points_per_axis: int = 120,
     random_state: int = 42,
     prefer_validation_csv: bool = False,
@@ -673,6 +1156,8 @@ def run_clean_mfgp(
         print("[stage] Loading runtime config...")
     runtime = load_runtime_config(config_path)
     runtime.out_dir_mfgp.mkdir(parents=True, exist_ok=True)
+    transform_mode = _target_transform_suffix(target_transform)
+    artifact_tag = f"{runtime.version}_{transform_mode}"
 
     cnp_csv_path = Path(cnp_csv).expanduser().resolve() if cnp_csv else discover_cnp_output_csv(
         runtime.out_dir_cnp,
@@ -695,16 +1180,30 @@ def run_clean_mfgp(
     )
 
     x_lf = lf[runtime.theta_headers].to_numpy(dtype=float)
-    y_lf = lf["y_cnp"].to_numpy(dtype=float)
+    y_lf_raw = lf["y_cnp"].to_numpy(dtype=float)
     x_hf = hf[runtime.theta_headers].to_numpy(dtype=float)
-    y_hf = hf["y_raw"].to_numpy(dtype=float)
+    y_hf_raw = hf["y_raw"].to_numpy(dtype=float)
+    y_lf, y_hf, transform_eps, use_log_lf, use_log_hf = _transform_mfgp_targets(
+        y_lf_raw,
+        y_hf_raw,
+        target_transform=transform_mode,
+        eps=log_epsilon,
+    )
     if verbose:
         print(f"[data] n_lf={len(lf)} n_hf={len(hf)} x_dim={x_lf.shape[1]}")
+        print(
+            f"[data] target_transform={transform_mode} "
+            f"use_log_lf={use_log_lf} use_log_hf={use_log_hf} eps={transform_eps:.3e}"
+        )
 
     # Noise levels reverted to old-notebook style.
     # LF noise = mean(y_cnp_err)
     # HF noise = std(y_raw) * 1e-8
-    lf_cnp_noise = float(np.nanmean(lf["y_cnp_err"].to_numpy(dtype=float)))
+    lf_cnp_err_raw = lf["y_cnp_err"].to_numpy(dtype=float)
+    if use_log_lf:
+        lf_cnp_noise = float(np.nanmean(_log_sigma_from_linear(y_lf_raw, lf_cnp_err_raw, transform_eps)))
+    else:
+        lf_cnp_noise = float(np.nanmean(lf_cnp_err_raw))
     hf_sim_noise = float(np.nanstd(y_hf))
     alpha_lf = lf_cnp_noise
     alpha_hf = hf_sim_noise * 1e-8
@@ -770,21 +1269,27 @@ def run_clean_mfgp(
     grid_lf_std = np.concatenate(gls_parts, axis=0)
 
     df_hf = hf.copy()
+    df_hf["y_raw_original"] = y_hf_raw
+    df_hf["y_raw"] = y_hf
+    df_hf["target_transform"] = transform_mode
+    df_hf["target_transform_eps"] = transform_eps
     df_hf["mf_mean"] = hf_pred_mean
     df_hf["mf_std"] = hf_pred_std
 
     df_grid = pd.DataFrame(grid_xy, columns=runtime.theta_headers)
+    df_grid["target_transform"] = transform_mode
+    df_grid["target_transform_eps"] = transform_eps
     df_grid["mf_mean"] = grid_mean
     df_grid["mf_std"] = grid_std
     df_grid["lf_mean"] = grid_lf_mean
     df_grid["lf_std"] = grid_lf_std
 
-    pred_csv = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_predictions_iter{iteration}.csv"
-    grid_csv = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_grid_iter{iteration}.csv"
+    pred_csv = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_predictions_iter{iteration}.csv"
+    grid_csv = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_grid_iter{iteration}.csv"
     df_hf.to_csv(pred_csv, index=False)
     df_grid.to_csv(grid_csv, index=False)
 
-    model_json = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_model_iter{iteration}.json"
+    model_json = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_model_iter{iteration}.json"
     model_json.write_text(
         json.dumps(
             {
@@ -795,6 +1300,10 @@ def run_clean_mfgp(
                 "lf_fidelity": int(lf_fidelity),
                 "hf_fidelity": int(hf_fidelity),
                 "theta_headers": runtime.theta_headers,
+                "target_transform": transform_mode,
+                "target_transform_eps": transform_eps,
+                "use_log_lf": bool(use_log_lf),
+                "use_log_hf": bool(use_log_hf),
                 "rho": float(model.rho),
                 "alpha_lf": float(alpha_lf),
                 "alpha_hf": float(alpha_hf),
@@ -805,7 +1314,7 @@ def run_clean_mfgp(
         )
     )
 
-    metrics_json = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_metrics_iter{iteration}.json"
+    metrics_json = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_metrics_iter{iteration}.json"
     metrics_json.write_text(
         json.dumps(
             {
@@ -815,14 +1324,17 @@ def run_clean_mfgp(
                 "n_lf": int(len(lf)),
                 "n_hf": int(len(hf)),
                 "rho": float(model.rho),
+                "target_transform": transform_mode,
+                "target_transform_eps": transform_eps,
             },
             indent=2,
         )
     )
 
-    data_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_hf_observations_iter{iteration}.png"
+    data_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_hf_observations_iter{iteration}.png"
     parity_plot = None
-    mean_std_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_mean_std_iter{iteration}.png"
+    mean_std_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_mean_std_iter{iteration}.png"
+    mean_std_plot_3d_html = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_mean_std_3d_interactive_iter{iteration}.html"
     residual_plot = None
 
     _plot_hf_observation_map(hf, runtime.theta_headers, data_plot)
@@ -835,12 +1347,37 @@ def run_clean_mfgp(
         hf_points=x_hf,
         out_path=mean_std_plot,
     )
+    interactive_3d_ok = _write_interactive_mean_std_surfaces_3d_html(
+        grid_xy,
+        grid_mean,
+        grid_std,
+        runtime.theta_headers,
+        hf_points=x_hf,
+        hf_mean_values=hf_pred_mean,
+        hf_std_values=hf_pred_std,
+        out_path=mean_std_plot_3d_html,
+    )
+    if not interactive_3d_ok:
+        mean_std_plot_3d_html = None
 
     theta_group_plot_dir: Optional[Path] = None
     across_theta_plot: Optional[Path] = None
     across_theta_zoom_plot: Optional[Path] = None
     coverage_plot: Optional[Path] = None
     validation_parity_plot: Optional[Path] = None
+    train_across_theta_linear_plot: Optional[Path] = None
+    train_across_theta_log_linear_sigma_plot: Optional[Path] = None
+    train_across_theta_log_log_sigma_plot: Optional[Path] = None
+    validation_across_theta_linear_plot: Optional[Path] = None
+    validation_across_theta_log_linear_sigma_plot: Optional[Path] = None
+    validation_across_theta_log_log_sigma_plot: Optional[Path] = None
+    train_parity_linear_plot: Optional[Path] = None
+    train_parity_log_plot: Optional[Path] = None
+    validation_parity_linear_plot: Optional[Path] = None
+    validation_parity_log_plot: Optional[Path] = None
+
+    # 3σ and parity diagnostics are intentionally produced only for held-out
+    # validation HF data. Training HF predictions remain available in pred_csv.
 
     # Additional old-notebook-style validation plots.
     val_csv = Path(validation_csv).expanduser().resolve() if validation_csv is not None else _resolve_optional_validation_csv(runtime)
@@ -859,31 +1396,71 @@ def run_clean_mfgp(
             if need.issubset(df_val.columns):
                 df_val = df_val[df_val["iteration"].astype(int) == int(iteration)].copy()
                 if len(df_val):
-                    theta_group_plot_dir = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_theta_group_plots_iter{iteration}"
-                    n_groups = _plot_theta_group_uncertainty_bands(
-                        df_val=df_val,
-                        theta_headers=runtime.theta_headers,
-                        model=model,
-                        out_dir=theta_group_plot_dir,
+                    df_val["y_raw_original"] = df_val["y_raw"].to_numpy(dtype=float)
+                    df_val["y_raw"] = _transform_series_for_mode(
+                        df_val["y_raw"].to_numpy(dtype=float),
+                        use_log=use_log_hf,
+                        eps=transform_eps,
                     )
-                    if verbose:
-                        print(f"[done] Generated theta-group uncertainty plots: {n_groups}")
+                    theta_group_plot_dir = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_theta_group_plots_iter{iteration}"
+                    if use_log_hf:
+                        # Per-theta helper is a log-y visualization; skip it when
+                        # the target itself is already log-transformed to avoid double logging.
+                        theta_group_plot_dir = None
+                    else:
+                        n_groups = _plot_theta_group_uncertainty_bands(
+                            df_val=df_val,
+                            theta_headers=runtime.theta_headers,
+                            model=model,
+                            out_dir=theta_group_plot_dir,
+                            band_mode="linear_sigma",
+                        )
+                        _plot_theta_group_uncertainty_bands(
+                            df_val=df_val,
+                            theta_headers=runtime.theta_headers,
+                            model=model,
+                            out_dir=theta_group_plot_dir,
+                            band_mode="log_sigma",
+                        )
+                        if verbose:
+                            print(f"[done] Generated theta-group uncertainty plots: {2 * n_groups}")
 
-                    across_theta_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_across_thetas_iter{iteration}.png"
+                    val_agg = _aggregate_theta_predictions_from_model(df_val, runtime.theta_headers, model)
+                    validation_across_theta_linear_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_validation_across_thetas_linear_iter{iteration}.png"
+
+                    y_true_v, y_pred_v, y_std_v = _plot_across_theta_series(
+                        val_agg,
+                        validation_across_theta_linear_plot,
+                        f"Validation HF Thetas: Mean Target vs MF-GP Prediction ({transform_mode}, {'Log10 Target Scale' if use_log_hf else 'Linear Scale'})",
+                        y_mode="linear",
+                        band_mode="linear_sigma",
+                    )
+                    across_theta_plot = validation_across_theta_linear_plot
                     across_theta_zoom_plot = None
-                    y_true_v, y_pred_v, y_std_v = _plot_across_thetas(
-                        df_val=df_val,
-                        theta_headers=runtime.theta_headers,
-                        model=model,
-                        out_path=across_theta_plot,
-                    )
 
-                    coverage_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_coverage_summary_iter{iteration}.png"
+                    if transform_mode in {"linear", "log_lf"}:
+                        validation_across_theta_log_linear_sigma_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_validation_across_thetas_log_linear_sigma_iter{iteration}.png"
+                        _plot_across_theta_series(
+                            val_agg,
+                            validation_across_theta_log_linear_sigma_plot,
+                            f"Validation HF Thetas: Mean Target vs MF-GP Prediction ({transform_mode}, Log y, Linear-σ Bands)",
+                            y_mode="log",
+                            band_mode="linear_sigma",
+                        )
+                        across_theta_zoom_plot = validation_across_theta_log_linear_sigma_plot
+
+                    coverage_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_coverage_summary_iter{iteration}.png"
                     _plot_coverage_summary(y_true_v, y_pred_v, y_std_v, coverage_plot)
 
-                    # Validation parity (per-theta means).
-                    validation_parity_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_validation_parity_iter{iteration}.png"
-                    _plot_parity(y_true_v, y_pred_v, y_std_v, validation_parity_plot)
+                    validation_parity_linear_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_validation_parity_linear_iter{iteration}.png"
+                    _plot_parity_linear(
+                        y_true_v,
+                        y_pred_v,
+                        y_std_v,
+                        validation_parity_linear_plot,
+                        f"Validation HF Parity Plot ({transform_mode}, {'Log10 Target Scale' if use_log_hf else 'Linear Scale'})",
+                    )
+                    validation_parity_plot = validation_parity_linear_plot
             elif verbose:
                 print("[warn] Validation CSV missing required columns for extra plots; skipping.")
         except Exception as exc:
@@ -908,13 +1485,60 @@ def run_clean_mfgp(
         data_plot=data_plot,
         parity_plot=parity_plot,
         mean_std_plot=mean_std_plot,
+        mean_std_plot_3d_html=mean_std_plot_3d_html,
         residual_plot=residual_plot,
         theta_group_plot_dir=theta_group_plot_dir,
         across_theta_plot=across_theta_plot,
         across_theta_zoom_plot=across_theta_zoom_plot,
         coverage_plot=coverage_plot,
         validation_parity_plot=validation_parity_plot,
+        train_across_theta_linear_plot=train_across_theta_linear_plot,
+        train_across_theta_log_linear_sigma_plot=train_across_theta_log_linear_sigma_plot,
+        train_across_theta_log_log_sigma_plot=train_across_theta_log_log_sigma_plot,
+        validation_across_theta_linear_plot=validation_across_theta_linear_plot,
+        validation_across_theta_log_linear_sigma_plot=validation_across_theta_log_linear_sigma_plot,
+        validation_across_theta_log_log_sigma_plot=validation_across_theta_log_log_sigma_plot,
+        train_parity_linear_plot=train_parity_linear_plot,
+        train_parity_log_plot=train_parity_log_plot,
+        validation_parity_linear_plot=validation_parity_linear_plot,
+        validation_parity_log_plot=validation_parity_log_plot,
     )
+
+
+def run_mfgp_transform_suite(
+    config_path: str | Path,
+    cnp_csv: Optional[str | Path] = None,
+    validation_csv: Optional[str | Path] = None,
+    transforms: Sequence[str] = ("linear", "log_hf", "log_lf", "log_both"),
+    iteration: int = 0,
+    lf_fidelity: int = 0,
+    hf_fidelity: int = 1,
+    log_epsilon: Optional[float] = None,
+    grid_points_per_axis: int = 120,
+    random_state: int = 42,
+    predict_chunk_size: int = 20000,
+    verbose: bool = True,
+) -> Dict[str, MFGPResult]:
+    results: Dict[str, MFGPResult] = {}
+    for transform in transforms:
+        mode = _target_transform_suffix(transform)
+        if verbose:
+            print(f"\n=== Running MF-GP target transform: {mode} ===")
+        results[mode] = run_clean_mfgp(
+            config_path=config_path,
+            cnp_csv=cnp_csv,
+            validation_csv=validation_csv,
+            iteration=iteration,
+            lf_fidelity=lf_fidelity,
+            hf_fidelity=hf_fidelity,
+            target_transform=mode,
+            log_epsilon=log_epsilon,
+            grid_points_per_axis=grid_points_per_axis,
+            random_state=random_state,
+            predict_chunk_size=predict_chunk_size,
+            verbose=verbose,
+        )
+    return results
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -925,6 +1549,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--iteration", type=int, default=0, help="Iteration value to filter")
     p.add_argument("--lf-fidelity", type=int, default=0, help="LF fidelity id")
     p.add_argument("--hf-fidelity", type=int, default=1, help="HF fidelity id")
+    p.add_argument(
+        "--target-transform",
+        type=str,
+        default="linear",
+        choices=["linear", "log_hf", "log_lf", "log_both"],
+        help="Target scale for MF-GP: linear, log HF only, log LF only, or log both",
+    )
+    p.add_argument("--log-epsilon", type=float, default=None, help="Optional explicit epsilon for log target transforms")
+    p.add_argument("--all-transforms", action="store_true", help="Run all four MF-GP target-transform experiments")
     p.add_argument("--grid-points", type=int, default=120, help="Grid points per axis")
     p.add_argument("--predict-chunk-size", type=int, default=20000, help="Chunk size for prediction progress")
     p.add_argument("--random-state", type=int, default=42, help="Random seed")
@@ -939,6 +1572,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    if args.all_transforms:
+        run_mfgp_transform_suite(
+            config_path=args.config,
+            cnp_csv=args.cnp_csv,
+            validation_csv=args.validation_csv,
+            iteration=args.iteration,
+            lf_fidelity=args.lf_fidelity,
+            hf_fidelity=args.hf_fidelity,
+            log_epsilon=args.log_epsilon,
+            grid_points_per_axis=args.grid_points,
+            random_state=args.random_state,
+            predict_chunk_size=args.predict_chunk_size,
+            verbose=not args.quiet,
+        )
+        return
+
     run_clean_mfgp(
         config_path=args.config,
         cnp_csv=args.cnp_csv,
@@ -946,6 +1595,8 @@ def main() -> None:
         iteration=args.iteration,
         lf_fidelity=args.lf_fidelity,
         hf_fidelity=args.hf_fidelity,
+        target_transform=args.target_transform,
+        log_epsilon=args.log_epsilon,
         grid_points_per_axis=args.grid_points,
         random_state=args.random_state,
         prefer_validation_csv=args.prefer_validation_csv,

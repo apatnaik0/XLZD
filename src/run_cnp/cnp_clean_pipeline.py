@@ -50,7 +50,10 @@ class CNPRuntimeConfig:
     target_headers: List[str]
     target_range: List[float]
     context_ratio: float
+    context_mode: str
+    training_mode: str
     epochs: int
+    steps_per_epoch: int
     batch_size_train: int
     files_per_batch_train: int
     batch_size_predict: List[int]
@@ -114,7 +117,10 @@ def load_runtime_config(config_path: str | Path, seed: int = 42) -> CNPRuntimeCo
         target_headers=list(sim.get("target_headers", ["inside_theta"])),
         target_range=[float(x) for x in sim.get("target_range", [0, 1])],
         context_ratio=float(cnp.get("context_ratio", 1 / 3)),
+        context_mode=str(cnp.get("context_mode", "random")).strip().lower(),
+        training_mode=str(cnp.get("training_mode", "minibatch")).strip().lower(),
         epochs=int(cnp.get("training_epochs", 15)),
+        steps_per_epoch=int(cnp.get("steps_per_epoch", 5000)),
         batch_size_train=int(cnp.get("batch_size_train", 4096)),
         files_per_batch_train=int(cnp.get("files_per_batch_train", 32)),
         batch_size_predict=[int(x) for x in cnp.get("batch_size_predict", [30000, 100000])],
@@ -170,6 +176,7 @@ class H5EventPool:
         self.rng = np.random.default_rng(seed)
         self.cache_files = cache_files
         self._cache: Dict[Path, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._row_count_cache: Dict[Path, int] = {}
 
         if not self.directory.exists():
             raise FileNotFoundError(f"H5 directory does not exist: {self.directory}")
@@ -231,6 +238,17 @@ class H5EventPool:
             self._cache[file_path] = (theta, phi, target)
         return theta, phi, target
 
+    def _count_rows_one(self, file_path: Path) -> int:
+        if file_path in self._row_count_cache:
+            return self._row_count_cache[file_path]
+
+        with h5py.File(file_path, "r") as f:
+            target_key = "target_mixedup" if self.use_mixedup and "target_mixedup" in f else "target"
+            n_rows = int(f[target_key].shape[0])
+
+        self._row_count_cache[file_path] = n_rows
+        return n_rows
+
     def sample_batch(self, batch_size: int, files_per_batch: int) -> EventBatch:
         chosen = self._choose_files(files_per_batch)
         per_file = max(1, batch_size // len(chosen))
@@ -256,6 +274,93 @@ class H5EventPool:
         x_arr = np.vstack(xs).astype(np.float32)
         y_arr = np.vstack(ys).astype(np.float32)
         return EventBatch(x=torch.from_numpy(x_arr), y=torch.from_numpy(y_arr))
+
+    def iter_epoch_batches(
+        self,
+        batch_size: int,
+        files_per_batch: int,
+        *,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ) -> Iterable[EventBatch]:
+        """Yield batches so every event row is seen once per epoch."""
+
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if files_per_batch <= 0:
+            raise ValueError("files_per_batch must be positive.")
+
+        file_order = list(self.files)
+        if shuffle and len(file_order) > 1:
+            perm = self.rng.permutation(len(file_order))
+            file_order = [file_order[i] for i in perm]
+
+        x_buffer: List[np.ndarray] = []
+        y_buffer: List[np.ndarray] = []
+        buffer_rows = 0
+
+        def flush_batches(final: bool = False) -> Iterable[EventBatch]:
+            nonlocal x_buffer, y_buffer, buffer_rows
+            if buffer_rows == 0:
+                return
+
+            x_arr = np.vstack(x_buffer).astype(np.float32)
+            y_arr = np.vstack(y_buffer).astype(np.float32)
+
+            if shuffle and len(x_arr) > 1:
+                perm = self.rng.permutation(len(x_arr))
+                x_arr = x_arr[perm]
+                y_arr = y_arr[perm]
+
+            n_full = len(x_arr) // batch_size
+            for batch_idx in range(n_full):
+                start = batch_idx * batch_size
+                end = start + batch_size
+                yield EventBatch(
+                    x=torch.from_numpy(x_arr[start:end]),
+                    y=torch.from_numpy(y_arr[start:end]),
+                )
+
+            used = n_full * batch_size
+            remainder_x = x_arr[used:]
+            remainder_y = y_arr[used:]
+
+            if final and len(remainder_x) and not drop_last:
+                yield EventBatch(x=torch.from_numpy(remainder_x), y=torch.from_numpy(remainder_y))
+                remainder_x = np.empty((0, x_arr.shape[1]), dtype=np.float32)
+                remainder_y = np.empty((0, y_arr.shape[1]), dtype=np.float32)
+
+            x_buffer = [remainder_x] if len(remainder_x) else []
+            y_buffer = [remainder_y] if len(remainder_y) else []
+            buffer_rows = int(len(remainder_x))
+
+        for start in range(0, len(file_order), files_per_batch):
+            file_group = file_order[start : start + files_per_batch]
+            for f in file_group:
+                theta, phi, target = self._load_one(f)
+                n = len(target)
+                if n == 0:
+                    continue
+                theta_rep = np.repeat(theta.reshape(1, -1), repeats=n, axis=0)
+                x = np.hstack([theta_rep, phi]).astype(np.float32)
+                y = target.astype(np.float32)
+                if shuffle and n > 1:
+                    perm = self.rng.permutation(n)
+                    x = x[perm]
+                    y = y[perm]
+                x_buffer.append(x)
+                y_buffer.append(y)
+                buffer_rows += n
+
+            yield from flush_batches(final=False)
+
+        yield from flush_batches(final=True)
+
+    def total_events(self) -> int:
+        total = 0
+        for f in self.files:
+            total += self._count_rows_one(f)
+        return total
 
     def iter_file_data(self) -> Iterable[Tuple[Path, np.ndarray, np.ndarray, np.ndarray]]:
         for f in self.files:
@@ -390,6 +495,7 @@ def split_context_target(
     y: torch.Tensor,
     context_ratio: float,
     rng: np.random.Generator,
+    context_mode: str = "random",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n = x.shape[0]
     if n < 4:
@@ -397,7 +503,14 @@ def split_context_target(
 
     min_context = max(2, int(0.1 * n))
     max_context = max(min_context + 1, int(context_ratio * n))
-    num_context = int(rng.integers(min_context, min(max_context, n - 1) + 1))
+    max_context = min(max_context, n - 1)
+
+    if context_mode == "fixed":
+        num_context = max(min_context, max_context)
+    elif context_mode == "random":
+        num_context = int(rng.integers(min_context, max_context + 1))
+    else:
+        raise ValueError(f"Unsupported context_mode={context_mode!r}. Expected 'random' or 'fixed'.")
 
     perm = rng.permutation(n)
     context_idx = perm[:num_context]
@@ -505,7 +618,7 @@ def _plot_train_val_snapshot(
 
 def train_cnp(
     runtime: CNPRuntimeConfig,
-    steps_per_epoch: int = 5000,
+    steps_per_epoch: Optional[int] = None,
     lr: float = 1e-4,
     weight_decay: float = 0.0,
     repr_dim: int = 32,
@@ -546,15 +659,50 @@ def train_cnp(
     monitor_every = int(monitor_every if monitor_every is not None else runtime.plot_after)
     history_rows: List[Dict[str, float]] = []
     global_step = 0
+    training_mode = runtime.training_mode
+    effective_steps_per_epoch = int(steps_per_epoch if steps_per_epoch is not None else runtime.steps_per_epoch)
+
+    if training_mode not in {"minibatch", "full_pass"}:
+        raise ValueError(f"Unsupported training_mode={training_mode!r}. Expected 'minibatch' or 'full_pass'.")
+
+    total_train_events = None
+    approx_batches_per_epoch = None
+    if training_mode == "full_pass":
+        total_train_events = pool.total_events()
+        approx_batches_per_epoch = int(np.ceil(total_train_events / runtime.batch_size_train))
+        print(
+            "[info] Full-pass dataloader mode is enabled. "
+            f"Each epoch sees all {total_train_events} training events in ≈{approx_batches_per_epoch} batches."
+        )
+    else:
+        print(
+            "[info] Random mini-batch mode is enabled. "
+            f"Each epoch uses {effective_steps_per_epoch} sampled steps."
+        )
 
     for epoch in range(runtime.epochs):
         model.train()
-        for _ in range(steps_per_epoch):
-            batch = pool.sample_batch(runtime.batch_size_train, runtime.files_per_batch_train)
+        epoch_steps = 0
+        if training_mode == "full_pass":
+            batch_iter: Iterable[EventBatch] = pool.iter_epoch_batches(
+                runtime.batch_size_train,
+                runtime.files_per_batch_train,
+                shuffle=True,
+                drop_last=False,
+            )
+        else:
+            batch_iter = (
+                pool.sample_batch(runtime.batch_size_train, runtime.files_per_batch_train)
+                for _ in range(effective_steps_per_epoch)
+            )
+
+        for batch in batch_iter:
+            if batch.x.shape[0] < 4:
+                continue
             x = batch.x.to(dev)
             y = batch.y.to(dev)
 
-            cx, cy, tx, ty = split_context_target(x, y, runtime.context_ratio, rng)
+            cx, cy, tx, ty = split_context_target(x, y, runtime.context_ratio, rng, context_mode=runtime.context_mode)
             logits, sigma = model(cx, cy, tx)
             train_bce = F.binary_cross_entropy_with_logits(logits, ty)
 
@@ -568,7 +716,9 @@ def train_cnp(
                 val_batch = pool.sample_batch(val_batch_size, max(1, runtime.files_per_batch_train // 2))
                 vx = val_batch.x.to(dev)
                 vy = val_batch.y.to(dev)
-                vcx, vcy, vtx, vty = split_context_target(vx, vy, runtime.context_ratio, rng)
+                vcx, vcy, vtx, vty = split_context_target(
+                    vx, vy, runtime.context_ratio, rng, context_mode=runtime.context_mode
+                )
                 vlogits, vsigma = model(vcx, vcy, vtx)
                 val_bce = F.binary_cross_entropy_with_logits(vlogits, vty)
 
@@ -632,11 +782,13 @@ def train_cnp(
                 _plot_training_history(hist_df_live, history_plot_live)
 
             global_step += 1
+            epoch_steps += 1
 
         latest = history_rows[-1]
         print(
             f"Epoch {epoch + 1}/{runtime.epochs} | "
             f"step={int(latest['step'])} | "
+            f"epoch_steps={epoch_steps} | "
             f"train_bce={latest['train_bce']:.5f} | "
             f"val_bce={latest['val_bce']:.5f}"
         )
@@ -657,6 +809,8 @@ def train_cnp(
             "phi_headers": runtime.phi_headers,
             "target_headers": runtime.target_headers,
             "epochs": runtime.epochs,
+            "training_mode": training_mode,
+            "context_mode": runtime.context_mode,
             "version": runtime.version,
         },
         model_path,
@@ -675,7 +829,7 @@ def train_cnp(
         sample = pool.sample_batch(min(4096, runtime.batch_size_train), runtime.files_per_batch_train)
         sx = sample.x.to(dev)
         sy = sample.y.to(dev)
-        scx, scy, stx, sty = split_context_target(sx, sy, runtime.context_ratio, rng)
+        scx, scy, stx, sty = split_context_target(sx, sy, runtime.context_ratio, rng, context_mode=runtime.context_mode)
         slogits, ssigma = model(scx, scy, stx)
         probs = torch.sigmoid(slogits).cpu().numpy().reshape(-1)
         truth = sty.cpu().numpy().reshape(-1)
@@ -988,7 +1142,141 @@ def predict_cnp(
 
 
 # -----------------------------
-# CLI entrypoint
+# Experiment wrappers
+# -----------------------------
+
+
+def run_minibatch_experiment(
+    *,
+    seed: int = 42,
+    device: Optional[str] = None,
+) -> Dict[str, str]:
+    config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_minibatch.yaml").resolve()
+    validation_config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_validation_minibatch.yaml").resolve()
+
+    runtime = load_runtime_config(config_path, seed=seed)
+    validation_runtime = load_runtime_config(validation_config_path, seed=seed)
+
+    train_result = train_cnp(runtime, device=device)
+    predict_result_train = predict_cnp(
+        runtime,
+        model_path=train_result.model_path,
+        chunk_size=20000,
+        device=device,
+    )
+    predict_result_validation = predict_cnp(
+        validation_runtime,
+        model_path=train_result.model_path,
+        chunk_size=20000,
+        device=device,
+    )
+
+    result = {
+        "config_path": str(config_path),
+        "validation_config_path": str(validation_config_path),
+        "model_path": str(train_result.model_path),
+        "history_csv": str(train_result.history_csv),
+        "history_plot": str(train_result.history_plot),
+        "sample_plot": str(train_result.sample_plot),
+        "train_csv": str(predict_result_train.csv_path),
+        "train_heatmap": str(predict_result_train.heatmap_path),
+        "train_error_heatmap": str(predict_result_train.error_heatmap_path),
+        "validation_csv": str(predict_result_validation.csv_path),
+        "validation_heatmap": str(predict_result_validation.heatmap_path),
+        "validation_error_heatmap": str(predict_result_validation.error_heatmap_path),
+    }
+    print(json.dumps(result, indent=2))
+    return result
+
+
+def run_fullpass_experiment(
+    *,
+    seed: int = 42,
+    device: Optional[str] = None,
+) -> Dict[str, str]:
+    config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_fullpass.yaml").resolve()
+    validation_config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_validation_fullpass.yaml").resolve()
+
+    runtime = load_runtime_config(config_path, seed=seed)
+    validation_runtime = load_runtime_config(validation_config_path, seed=seed)
+
+    train_result = train_cnp(runtime, device=device)
+    predict_result_train = predict_cnp(
+        runtime,
+        model_path=train_result.model_path,
+        chunk_size=20000,
+        device=device,
+    )
+    predict_result_validation = predict_cnp(
+        validation_runtime,
+        model_path=train_result.model_path,
+        chunk_size=20000,
+        device=device,
+    )
+
+    result = {
+        "config_path": str(config_path),
+        "validation_config_path": str(validation_config_path),
+        "model_path": str(train_result.model_path),
+        "history_csv": str(train_result.history_csv),
+        "history_plot": str(train_result.history_plot),
+        "sample_plot": str(train_result.sample_plot),
+        "train_csv": str(predict_result_train.csv_path),
+        "train_heatmap": str(predict_result_train.heatmap_path),
+        "train_error_heatmap": str(predict_result_train.error_heatmap_path),
+        "validation_csv": str(predict_result_validation.csv_path),
+        "validation_heatmap": str(predict_result_validation.heatmap_path),
+        "validation_error_heatmap": str(predict_result_validation.error_heatmap_path),
+    }
+    print(json.dumps(result, indent=2))
+    return result
+
+
+def run_fixed_context_experiment(
+    *,
+    seed: int = 42,
+    device: Optional[str] = None,
+) -> Dict[str, str]:
+    config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_fixedcontext.yaml").resolve()
+    validation_config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_validation_fixedcontext.yaml").resolve()
+
+    runtime = load_runtime_config(config_path, seed=seed)
+    validation_runtime = load_runtime_config(validation_config_path, seed=seed)
+
+    train_result = train_cnp(runtime, device=device)
+    predict_result_train = predict_cnp(
+        runtime,
+        model_path=train_result.model_path,
+        chunk_size=20000,
+        device=device,
+    )
+    predict_result_validation = predict_cnp(
+        validation_runtime,
+        model_path=train_result.model_path,
+        chunk_size=20000,
+        device=device,
+    )
+
+    result = {
+        "config_path": str(config_path),
+        "validation_config_path": str(validation_config_path),
+        "model_path": str(train_result.model_path),
+        "history_csv": str(train_result.history_csv),
+        "history_plot": str(train_result.history_plot),
+        "sample_plot": str(train_result.sample_plot),
+        "train_csv": str(predict_result_train.csv_path),
+        "train_heatmap": str(predict_result_train.heatmap_path),
+        "train_error_heatmap": str(predict_result_train.error_heatmap_path),
+        "validation_csv": str(predict_result_validation.csv_path),
+        "validation_heatmap": str(predict_result_validation.heatmap_path),
+        "validation_error_heatmap": str(predict_result_validation.error_heatmap_path),
+    }
+    print(json.dumps(result, indent=2))
+    return result
+
+
+# -----------------------------
+# Optional CLI utilities
 # -----------------------------
 
 
@@ -1000,10 +1288,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default=None, help="Torch device (e.g., cpu, cuda)")
 
     sub = p.add_subparsers(dest="cmd", required=False)
-    p.set_defaults(cmd="full")
+    p.set_defaults(
+        cmd="full",
+        steps_per_epoch=None,
+        lr=1e-4,
+        weight_decay=0.0,
+        repr_dim=32,
+        hidden=128,
+        dropout=0.1,
+        monitor_every=None,
+        show_monitor_plots=False,
+        mc_samples=30,
+        chunk_size=20000,
+        output_suffix=None,
+        output_epochs=None,
+        model_path=None,
+    )
 
     tr = sub.add_parser("train", help="Train CNP")
-    tr.add_argument("--steps-per-epoch", type=int, default=5000)
+    tr.add_argument("--steps-per-epoch", type=int, default=None)
     tr.add_argument("--lr", type=float, default=1e-4)
     tr.add_argument("--weight-decay", type=float, default=0.0)
     tr.add_argument("--repr-dim", type=int, default=32)
@@ -1012,7 +1315,7 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--monitor-every", type=int, default=None, help="Log and save monitor plots every N steps (default: settings plot_after)")
     tr.add_argument("--show-monitor-plots", action="store_true", help="Display monitor plots inline when running in notebooks/IPython")
     tr.set_defaults(
-        steps_per_epoch=5000,
+        steps_per_epoch=None,
         lr=1e-4,
         weight_decay=0.0,
         repr_dim=32,
@@ -1036,7 +1339,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     fu = sub.add_parser("full", help="Train then predict")
-    fu.add_argument("--steps-per-epoch", type=int, default=5000)
+    fu.add_argument("--steps-per-epoch", type=int, default=None)
     fu.add_argument("--lr", type=float, default=1e-4)
     fu.add_argument("--weight-decay", type=float, default=0.0)
     fu.add_argument("--repr-dim", type=int, default=32)
@@ -1049,7 +1352,7 @@ def build_parser() -> argparse.ArgumentParser:
     fu.add_argument("--output-suffix", type=str, default=None)
     fu.add_argument("--output-epochs", type=int, default=None)
     fu.set_defaults(
-        steps_per_epoch=5000,
+        steps_per_epoch=None,
         lr=1e-4,
         weight_decay=0.0,
         repr_dim=32,
@@ -1144,4 +1447,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_minibatch_experiment()
+    # run_fixed_context_experiment()
+    # run_fullpass_experiment()
+    # main()

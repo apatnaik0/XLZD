@@ -45,16 +45,16 @@ def _default_config_path() -> Path:
     script_dir = Path(__file__).resolve().parent
     cwd = Path.cwd().resolve()
     candidates = [
-        cwd / "src/xlzd/settings.yaml",
-        cwd / "xlzd/settings.yaml",
-        script_dir / "../xlzd/settings.yaml",
+        cwd / "src/xlzd/settings_minibatch.yaml",
+        cwd / "xlzd/settings_minibatch.yaml",
+        script_dir / "../xlzd/settings_minibatch.yaml",
     ]
     for c in candidates:
         c = c.resolve()
         if c.exists():
             return c
     # Fallback to canonical repo-relative location.
-    return (script_dir / "../xlzd/settings.yaml").resolve()
+    return (script_dir / "../xlzd/settings_minibatch.yaml").resolve()
 
 
 def _resolve_model_path(model_path: Optional[str], runtime) -> Path:
@@ -230,7 +230,7 @@ def run_per_signal_prediction(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Per-event/per-signal CNP prediction export")
-    p.add_argument("--config", type=str, default=str(_default_config_path()), help="Path to XLZD settings.yaml")
+    p.add_argument("--config", type=str, default=str(_default_config_path()), help="Path to XLZD settings_minibatch.yaml")
     p.add_argument("--model-path", type=str, default=None, help="Model checkpoint .pth (defaults from config)")
     p.add_argument("--out-csv", type=str, default=None, help="Output CSV path (defaults in path_out_cnp)")
     p.add_argument("--mc-samples", type=int, default=30, help="MC dropout samples per chunk")
