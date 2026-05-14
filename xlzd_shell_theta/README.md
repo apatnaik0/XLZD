@@ -67,6 +67,8 @@ This keeps the target comparable across files and trials with different sample s
   - CNP training and prediction notebook
 - `01_shell_theta_mfgp.ipynb`
   - MF-GP notebook with the same transform/plot style as the earlier workflows
+- `variations/`
+  - five parameter-variation notebooks plus their preprocessing configs and CNP settings
 
 ## Run order
 

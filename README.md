@@ -10,6 +10,10 @@ This repository contains:
 - alternative theta experiments
 - depth-penetration modeling experiments and interactive visualizations
 
+For a detailed explanation of the code structure, experiment logic, and why each branch exists, see:
+
+- [`PROJECT_EXPERIMENT_GUIDE.md`](PROJECT_EXPERIMENT_GUIDE.md)
+
 ## Repository Structure
 
 ### Core pipeline

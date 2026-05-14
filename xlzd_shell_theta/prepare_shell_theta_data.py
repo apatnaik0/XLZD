@@ -65,6 +65,9 @@ class ShellGridConfig:
     min_candidate_events: int = 25
     z_center: float | None = 1982.48
     rounding_decimals: int = 6
+    target_mode: str = "hard_box"
+    soft_sigma_r: float | None = None
+    soft_sigma_z: float | None = None
 
     def validate(self) -> None:
         if self.r_shell_step <= 0 or self.z_shell_step <= 0:
@@ -79,6 +82,12 @@ class ShellGridConfig:
             raise ValueError("min_candidate_events must be positive.")
         if self.rounding_decimals < 0:
             raise ValueError("rounding_decimals must be non-negative.")
+        if self.target_mode not in {"hard_box", "soft_gaussian"}:
+            raise ValueError("target_mode must be one of {'hard_box', 'soft_gaussian'}.")
+        if self.soft_sigma_r is not None and self.soft_sigma_r <= 0:
+            raise ValueError("soft_sigma_r must be positive when provided.")
+        if self.soft_sigma_z is not None and self.soft_sigma_z <= 0:
+            raise ValueError("soft_sigma_z must be positive when provided.")
 
 
 @dataclass(slots=True)
@@ -157,6 +166,17 @@ def build_config(args: argparse.Namespace) -> ShellPipelineConfig:
             min_candidate_events=int(shell.get("min_candidate_events", 25)),
             z_center=shell.get("z_center"),
             rounding_decimals=int(shell.get("rounding_decimals", 6)),
+            target_mode=str(shell.get("target_mode", "hard_box")),
+            soft_sigma_r=(
+                None
+                if shell.get("soft_sigma_r") is None
+                else float(shell.get("soft_sigma_r"))
+            ),
+            soft_sigma_z=(
+                None
+                if shell.get("soft_sigma_z") is None
+                else float(shell.get("soft_sigma_z"))
+            ),
         ),
         output=OutputConfig(
             output_dir=Path(output.get("output_dir", "outputs_shell_theta")),
@@ -290,6 +310,31 @@ def near_shell_mask(df: pd.DataFrame, *, r_shell: float, z_shell: float, delta_r
     )
 
 
+def shell_target_values(
+    df: pd.DataFrame,
+    *,
+    r_shell: float,
+    z_shell: float,
+    shell_cfg: ShellGridConfig,
+) -> np.ndarray:
+    required = {"r", Z_FROM_CENTER_COLUMN}
+    if not required.issubset(df.columns):
+        raise ValueError(f"Block dataframe must contain columns {required}.")
+
+    dr = np.abs(df["r"].to_numpy(dtype=float) - float(r_shell))
+    dz = np.abs(df[Z_FROM_CENTER_COLUMN].to_numpy(dtype=float) - float(z_shell))
+
+    if shell_cfg.target_mode == "hard_box":
+        return (
+            (dr <= float(shell_cfg.delta_r)) & (dz <= float(shell_cfg.delta_z))
+        ).astype(np.float32)
+
+    sigma_r = float(shell_cfg.soft_sigma_r or shell_cfg.delta_r)
+    sigma_z = float(shell_cfg.soft_sigma_z or shell_cfg.delta_z)
+    values = np.exp(-0.5 * ((dr / sigma_r) ** 2 + (dz / sigma_z) ** 2))
+    return np.clip(values, 0.0, 1.0).astype(np.float32)
+
+
 def write_shell_theta_block_files(
     *,
     blocks: Sequence[pd.DataFrame],
@@ -316,13 +361,12 @@ def write_shell_theta_block_files(
         out_df["fidelity"] = fidelity
         out_df["r_shell"] = r_shell
         out_df["z_shell"] = z_shell
-        out_df[TARGET_COLUMN] = near_shell_mask(
+        out_df[TARGET_COLUMN] = shell_target_values(
             out_df,
             r_shell=r_shell,
             z_shell=z_shell,
-            delta_r=shell_cfg.delta_r,
-            delta_z=shell_cfg.delta_z,
-        ).astype(np.int8)
+            shell_cfg=shell_cfg,
+        ).astype(np.float32)
 
         filename = _build_shell_filename(
             fidelity=fidelity,
@@ -333,7 +377,7 @@ def write_shell_theta_block_files(
         )
         written_path = save_dataframe(out_df, output_dir / Path(filename).stem, output_format)
 
-        near_count = int(out_df[TARGET_COLUMN].sum())
+        target_sum = float(out_df[TARGET_COLUMN].sum())
         records.append(
             {
                 "block_index": int(block_index),
@@ -345,8 +389,8 @@ def write_shell_theta_block_files(
                 "sample_size": int(len(out_df)),
                 "r_shell": r_shell,
                 "z_shell": z_shell,
-                "near_shell_count": near_count,
-                "near_shell_fraction": float(near_count / len(out_df)),
+                "target_sum": target_sum,
+                "target_mean": float(target_sum / len(out_df)),
             }
         )
 
@@ -373,6 +417,7 @@ def print_summary(
     print(f"Final-position r range: [{all_events['r'].min():.6g}, {all_events['r'].max():.6g}]")
     print(f"Final-position z_from_center range: [{all_events[Z_FROM_CENTER_COLUMN].min():.6g}, {all_events[Z_FROM_CENTER_COLUMN].max():.6g}]")
     print(f"Shell widths: delta_r={shell_cfg.delta_r:.6g}, delta_z={shell_cfg.delta_z:.6g}")
+    print(f"Target mode: {shell_cfg.target_mode}")
     print(f"Valid shell-theta candidates: {len(candidates_df):,}")
     print(
         f"Pool sizes: LF={pool_sizes['lf']:,}, HF={pool_sizes['hf']:,}, VAL={pool_sizes['validation']:,}"
@@ -392,7 +437,7 @@ def print_summary(
     print(
         describe_target_columns(
             manifest_df,
-            ["sample_size", "near_shell_count", "near_shell_fraction"],
+            ["sample_size", "target_sum", "target_mean"],
         ).to_string()
     )
 

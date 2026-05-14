@@ -45,7 +45,7 @@ def read_table_checked(table_path: Path) -> pd.DataFrame:
 def build_arrays(df: pd.DataFrame, fidelity_value: float) -> Tuple[np.ndarray, ...]:
     theta_values = df[THETA_COLS].iloc[0].to_numpy(dtype=np.float64)
     phi_values = df[PHI_COLS].to_numpy(dtype=np.float32)
-    target_values = df[TARGET_COLS].to_numpy(dtype=np.int8)
+    target_values = df[TARGET_COLS].to_numpy(dtype=np.float32)
 
     if WEIGHTS_COL in df.columns:
         weights_values = df[[WEIGHTS_COL]].to_numpy(dtype=np.float32)
