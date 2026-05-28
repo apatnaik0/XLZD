@@ -281,6 +281,33 @@ The input CSV can provide `s_r` and `s_z_from_center` directly. If not, the scri
 - `s_r` from `s_r`, `r_start`, `source_r`, `r`, or from `sx/sy`
 - `s_z_from_center` from `s_z_from_center`, `z_start_from_center`, `source_z_from_center`, `z_from_center`, or from `sz - z_center`
 
+For Peter-style source CSVs with columns such as:
+
+```text
+sx,sy,sz,E0,ETPC,x,y,z
+```
+
+the script uses:
+
+- `s_r = sqrt(sx^2 + sy^2)`
+- `s_z_from_center = abs(sz - z_center)`
+
+The `x,y,z` columns are not treated as predicted outputs by this CNP. They are ignored unless you explicitly include them in the output with `--include-input-columns`.
+
+To scan every equal-volume shell theta instead of passing one theta manually:
+
+```bash
+python xlzd_equal_volume_shell_theta/predict_cnp_on_csv.py \
+  --input-csv path/to/source_points.csv \
+  --output-csv data/out/cnp/source_points_all_shell_predictions.csv \
+  --config xlzd_equal_volume_shell_theta/settings_equal_volume_shell_minibatch.yaml \
+  --all-shells \
+  --include-input-columns \
+  --overwrite
+```
+
+`--all-shells` reads `R_max`, `Z_max`, and `n_shells` from `xlzd_equal_volume_shell_theta/config/pipeline_config.json` unless you override them with `--R-max`, `--Z-max`, or `--n-shells`.
+
 Important caveat: the CNP needs a context set. This script uses empirical H5 training files as the context, so synthetic CSV rows do not need known targets and do not contaminate the context.
 
 ## Notebook Parameters

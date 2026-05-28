@@ -9,6 +9,7 @@ CNP context set, then evaluates new CSV rows as target/query points.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Iterable
@@ -29,6 +30,7 @@ from cnp_clean_pipeline import H5EventPool, load_model_checkpoint, load_runtime_
 
 
 DEFAULT_CONFIG = Path("xlzd_equal_volume_shell_theta/settings_equal_volume_shell_minibatch.yaml")
+DEFAULT_PIPELINE_CONFIG = Path("xlzd_equal_volume_shell_theta/config/pipeline_config.json")
 DEFAULT_Z_CENTER = 1982.48
 
 
@@ -57,6 +59,20 @@ def parse_args() -> argparse.Namespace:
         help="Optional CSV of theta queries. Must contain the config theta_headers columns.",
     )
     parser.add_argument(
+        "--all-shells",
+        action="store_true",
+        help="Predict against every equal-volume shell boundary from the pipeline config.",
+    )
+    parser.add_argument(
+        "--pipeline-config",
+        type=Path,
+        default=DEFAULT_PIPELINE_CONFIG,
+        help="JSON config used by --all-shells to get R_max, Z_max, and n_shells.",
+    )
+    parser.add_argument("--R-max", type=float, default=None, help="Override R_max for --all-shells.")
+    parser.add_argument("--Z-max", type=float, default=None, help="Override Z_max for --all-shells.")
+    parser.add_argument("--n-shells", type=int, default=None, help="Override n_shells for --all-shells.")
+    parser.add_argument(
         "--context-dir",
         type=Path,
         default=None,
@@ -70,6 +86,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rows", type=int, default=None, help="Optional limit for quick test runs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for context sampling.")
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cpu or cuda.")
+    parser.add_argument(
+        "--include-input-columns",
+        action="store_true",
+        help="Copy the original input CSV columns into the prediction output.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite output CSV if it exists.")
     return parser.parse_args()
 
@@ -80,14 +101,49 @@ def resolve_model_path(runtime, model_path: Path | None) -> Path:
     return runtime.out_dir / f"cnp_{runtime.version}_model_{runtime.epochs}epochs.pth"
 
 
+def read_pipeline_shell_config(args: argparse.Namespace) -> tuple[float, float, int]:
+    raw = {}
+    pipeline_path = args.pipeline_config.expanduser().resolve()
+    if pipeline_path.exists():
+        raw = json.loads(pipeline_path.read_text())
+    shell_cfg = raw.get("shell", {})
+
+    r_max = float(args.R_max if args.R_max is not None else shell_cfg.get("R_max", 1500.0))
+    z_max = float(args.Z_max if args.Z_max is not None else shell_cfg.get("Z_max", 2000.0))
+    n_shells = int(args.n_shells if args.n_shells is not None else shell_cfg.get("n_shells", 100))
+    if r_max <= 0 or z_max <= 0 or n_shells <= 0:
+        raise ValueError("R_max, Z_max, and n_shells must be positive for --all-shells.")
+    return r_max, z_max, n_shells
+
+
+def build_equal_volume_theta_queries(args: argparse.Namespace, theta_headers: list[str]) -> pd.DataFrame:
+    if theta_headers != ["R_shell", "Z_shell"]:
+        raise ValueError("--all-shells currently expects theta headers ['R_shell', 'Z_shell'].")
+    r_max, z_max, n_shells = read_pipeline_shell_config(args)
+    shell_index = np.arange(1, n_shells + 1, dtype=float)
+    scale = np.cbrt(shell_index / float(n_shells))
+    return pd.DataFrame(
+        {
+            "shell_index": shell_index.astype(int),
+            "shell_scale": scale.astype(float),
+            "R_shell": r_max * scale,
+            "Z_shell": z_max * scale,
+        }
+    )
+
+
 def read_theta_queries(args: argparse.Namespace, theta_headers: list[str]) -> pd.DataFrame:
-    if args.theta is not None and args.theta_csv is not None:
-        raise ValueError("Use either --theta or --theta-csv, not both.")
-    if args.theta is None and args.theta_csv is None:
+    n_theta_modes = sum(x is not None for x in [args.theta, args.theta_csv]) + int(bool(args.all_shells))
+    if n_theta_modes > 1:
+        raise ValueError("Use only one theta mode: --theta, --theta-csv, or --all-shells.")
+    if n_theta_modes == 0:
         raise ValueError(
-            "Provide a theta query with --theta or --theta-csv. "
+            "Provide theta queries with --theta, --theta-csv, or --all-shells. "
             f"Expected theta headers: {theta_headers}"
         )
+
+    if args.all_shells:
+        return build_equal_volume_theta_queries(args, theta_headers)
 
     if args.theta is not None:
         if len(args.theta) != len(theta_headers):
@@ -100,7 +156,8 @@ def read_theta_queries(args: argparse.Namespace, theta_headers: list[str]) -> pd
         raise ValueError(f"{args.theta_csv} is missing theta columns: {missing}")
     if theta_df.empty:
         raise ValueError(f"{args.theta_csv} has no theta rows.")
-    return theta_df[theta_headers].copy()
+    extra_cols = [col for col in ["shell_index", "shell_scale"] if col in theta_df.columns]
+    return theta_df[extra_cols + theta_headers].copy()
 
 
 def first_existing_column(df: pd.DataFrame, names: Iterable[str]) -> str | None:
@@ -110,33 +167,39 @@ def first_existing_column(df: pd.DataFrame, names: Iterable[str]) -> str | None:
     return None
 
 
-def derive_phi_table(df: pd.DataFrame, phi_headers: list[str], z_center: float) -> pd.DataFrame:
+def derive_phi_table(df: pd.DataFrame, phi_headers: list[str], z_center: float) -> tuple[pd.DataFrame, dict[str, str]]:
     out = pd.DataFrame(index=df.index)
+    sources: dict[str, str] = {}
 
     for name in phi_headers:
         if name in df.columns:
             out[name] = df[name].astype(float)
+            sources[name] = name
             continue
 
         if name == "s_r":
             direct = first_existing_column(df, ["r_start", "source_r", "r"])
             if direct is not None:
                 out[name] = df[direct].astype(float)
+                sources[name] = direct
                 continue
             sx = first_existing_column(df, ["sx", "s_x", "source_x", "x"])
             sy = first_existing_column(df, ["sy", "s_y", "source_y", "y"])
             if sx is not None and sy is not None:
                 out[name] = np.sqrt(df[sx].astype(float) ** 2 + df[sy].astype(float) ** 2)
+                sources[name] = f"sqrt({sx}^2 + {sy}^2)"
                 continue
 
         if name == "s_z_from_center":
             direct = first_existing_column(df, ["z_start_from_center", "source_z_from_center", "z_from_center"])
             if direct is not None:
                 out[name] = df[direct].astype(float).abs()
+                sources[name] = f"abs({direct})"
                 continue
             sz = first_existing_column(df, ["sz", "s_z", "source_z", "z_start", "z"])
             if sz is not None:
                 out[name] = (df[sz].astype(float) - float(z_center)).abs()
+                sources[name] = f"abs({sz} - {z_center})"
                 continue
 
         raise ValueError(
@@ -144,7 +207,7 @@ def derive_phi_table(df: pd.DataFrame, phi_headers: list[str], z_center: float) 
             "Provide it directly or include compatible source coordinate columns."
         )
 
-    return out.astype(np.float32)
+    return out.astype(np.float32), sources
 
 
 def sample_context(runtime, context_dir: Path, context_size: int, context_files: int | None, seed: int, device: torch.device):
@@ -176,6 +239,7 @@ def write_prediction_chunks(
     output_csv: Path,
     chunk_size: int,
     mc_samples: int,
+    include_input_columns: bool,
 ) -> int:
     header_written = False
     total_rows = 0
@@ -203,8 +267,15 @@ def write_prediction_chunks(
                 )
                 for i, name in enumerate(theta_headers):
                     out[name] = theta_values[i]
+                for name in ["shell_index", "shell_scale"]:
+                    if name in theta_row.index:
+                        out[name] = theta_row[name]
                 for name in phi_headers:
                     out[name] = phi_df.iloc[start:end][name].to_numpy()
+
+                if include_input_columns:
+                    input_chunk = source_df.iloc[start:end].reset_index(drop=True).add_prefix("input_")
+                    out = pd.concat([out.reset_index(drop=True), input_chunk], axis=1)
 
                 if y_raw_col is not None:
                     out["y_raw"] = source_df.iloc[start:end][y_raw_col].to_numpy()
@@ -256,7 +327,7 @@ def main() -> None:
         raise ValueError(f"No rows found in input CSV: {args.input_csv}")
 
     theta_df = read_theta_queries(args, runtime.theta_headers)
-    phi_df = derive_phi_table(source_df, runtime.phi_headers, z_center=args.z_center)
+    phi_df, phi_sources = derive_phi_table(source_df, runtime.phi_headers, z_center=args.z_center)
 
     set_seed(args.seed)
     model = load_model_checkpoint(model_path, device=args.device)
@@ -291,6 +362,7 @@ def main() -> None:
     print(f"theta_queries: {len(theta_df):,}")
     print(f"theta_headers: {runtime.theta_headers}")
     print(f"phi_headers: {runtime.phi_headers}")
+    print(f"phi_sources: {phi_sources}")
 
     total = write_prediction_chunks(
         model=model,
@@ -306,6 +378,7 @@ def main() -> None:
         output_csv=output_csv,
         chunk_size=int(args.chunk_size),
         mc_samples=int(args.mc_samples),
+        include_input_columns=bool(args.include_input_columns),
     )
     print(f"Done. prediction_rows_written={total:,}")
 
