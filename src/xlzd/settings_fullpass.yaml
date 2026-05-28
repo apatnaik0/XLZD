@@ -1,6 +1,6 @@
 cnp_settings:
-  training_mode: minibatch
-  training_epochs: 15
+  training_mode: full_pass
+  training_epochs: 100
   steps_per_epoch: 5000
   context_ratio: 0.3333333
   context_is_subset: True
@@ -14,7 +14,7 @@ cnp_settings:
   use_beta: [0.1, 0.1]
   signal_to_background_ratio: ""
   ratio_testing_vs_training: 1/10
-  plot_after: 5000
+  plot_after: 500
 
 simulation_settings:
   theta_headers: ["R_max", "Z_max"]
@@ -30,17 +30,18 @@ simulation_settings:
   hf_cost: 10
 
 path_settings:
-  version: xlzd_v1
+  version: xlzd_v1_fullpass
 
   path_to_files_train: ../../outputs/training/lf
 
   path_to_files_predict:
-    - ../../outputs/validation/hf
+    - ../../outputs/training/lf
+    - ../../outputs/training/hf
 
-  iteration: [0]
-  fidelity: [1]
+  iteration: [0, 0]
+  fidelity: [0, 1]
 
-  path_to_files_validation: ../../data/out/cnp/cnp_xlzd_v1_output_validation_15epochs.csv
+  path_to_files_validation: ../../data/out/cnp/cnp_xlzd_v1_fullpass_output_validation_15epochs.csv
 
   path_out_cnp: ../../data/out/cnp
   path_out_mfgp: ../../data/out/mfgp

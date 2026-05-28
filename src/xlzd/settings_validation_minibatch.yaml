@@ -30,7 +30,7 @@ simulation_settings:
   hf_cost: 10
 
 path_settings:
-  version: xlzd_v1
+  version: xlzd_v1_minibatch
 
   path_to_files_train: ../../outputs/training/lf
 
@@ -40,7 +40,7 @@ path_settings:
   iteration: [0]
   fidelity: [1]
 
-  path_to_files_validation: ../../data/out/cnp/cnp_xlzd_v1_output_validation_15epochs.csv
+  path_to_files_validation: ../../data/out/cnp/cnp_xlzd_v1_minibatch_output_validation_15epochs.csv
 
   path_out_cnp: ../../data/out/cnp
   path_out_mfgp: ../../data/out/mfgp

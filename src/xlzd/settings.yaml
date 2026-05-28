@@ -1,5 +1,7 @@
 cnp_settings:
+  training_mode: minibatch
   training_epochs: 15
+  steps_per_epoch: 5000
   context_ratio: 0.3333333
   context_is_subset: True
   batch_size_train: 12000
@@ -12,7 +14,7 @@ cnp_settings:
   use_beta: [0.1, 0.1]
   signal_to_background_ratio: ""
   ratio_testing_vs_training: 1/10
-  plot_after: 1000
+  plot_after: 5000
 
 simulation_settings:
   theta_headers: ["R_max", "Z_max"]
