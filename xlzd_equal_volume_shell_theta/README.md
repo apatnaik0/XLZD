@@ -281,7 +281,7 @@ The input CSV can provide `s_r` and `s_z_from_center` directly. If not, the scri
 - `s_r` from `s_r`, `r_start`, `source_r`, `r`, or from `sx/sy`
 - `s_z_from_center` from `s_z_from_center`, `z_start_from_center`, `source_z_from_center`, `z_from_center`, or from `sz - z_center`
 
-For Peter-style source CSVs with columns such as:
+For source CSVs with columns such as:
 
 ```text
 sx,sy,sz,E0,ETPC,x,y,z
