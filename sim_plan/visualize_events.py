@@ -92,7 +92,8 @@ def create_plot(df, plot_name="plot.html", fraction=0.01, r_max=None, z_min=None
 
 if __name__ == "__main__":
     # Choose file from available ones
-    csv_files = glob.glob("../data/*.csv")
+    data_file = "./data_emulated/*.csv"
+    csv_files = glob.glob(data_file)
 
     # Load in each file, calculate sr/st/r/t and add a file dictating which file it is
     # After all are loaded in, concatenate them into one dataframe

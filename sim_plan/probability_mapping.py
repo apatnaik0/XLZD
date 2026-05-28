@@ -7,7 +7,8 @@ from visualize_events import create_plot
 from scipy.stats import binned_statistic_2d
 
 # Choose file from available ones
-csv_files = glob.glob("../data/*.csv")
+data_file = "../data/*.csv"
+csv_files = glob.glob(data_file)
 
 # Load in each file, calculate sr/st/r/t and add a file dictating which file it is
 # After all are loaded in, concatenate them into one dataframe
