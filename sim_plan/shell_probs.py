@@ -140,4 +140,4 @@ if __name__ == "__main__":
 
     num_shells = 100
     #shell_occupancy(data, ["const_vol", "quintic", "linear", "exp"], max_z, max_r, num_shells)
-    shell_distribution(data, max_z, max_r, num_shells)
+    #shell_distribution(data, max_z, max_r, num_shells)
