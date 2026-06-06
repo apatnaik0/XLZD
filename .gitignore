@@ -15,6 +15,8 @@ outputs_smoke/**
 !outputs_smoke/**/
 !outputs_smoke/**/.gitkeep
 
+outputs_equal_volume_shell_theta/
+
 # Depth penetration HTML artifacts
 depth_penetration_experiments/artifacts/**
 !depth_penetration_experiments/artifacts/.gitkeep
@@ -38,3 +40,6 @@ env/
 .DS_Store
 .idea/
 .vscode/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/

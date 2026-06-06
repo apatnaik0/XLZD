@@ -38,6 +38,7 @@ from sklearn.preprocessing import StandardScaler
 class MFGPRuntimeConfig:
     config_path: Path
     version: str
+    sim_type: str
     theta_headers: List[str]
     theta_min: List[float]
     theta_max: List[float]
@@ -75,6 +76,7 @@ def load_runtime_config(config_path: str | Path) -> MFGPRuntimeConfig:
     return MFGPRuntimeConfig(
         config_path=cp,
         version=str(paths.get("version", "v_clean")),
+        sim_type=str(sim.get("simulation_type")),
         theta_headers=list(sim.get("theta_headers", ["R_max", "Z_max"])),
         theta_min=[float(x) for x in sim.get("theta_min", [0.0, 0.0])],
         theta_max=[float(x) for x in sim.get("theta_max", [1.0, 1.0])],
@@ -504,6 +506,67 @@ def _plot_parity_log(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray, 
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
 
+def _plot_mean_std_linear(
+    grid_xy: np.ndarray,
+    mean_hf: np.ndarray,
+    std_hf: np.ndarray,
+    x_cols: Sequence[str],
+    hf_points: Optional[np.ndarray],
+    out_path: Path) -> None:
+
+    # Plots the mean and std in a line plot instead of 2D
+    # Useful for shell distributions for ease of recognition
+    gx = np.unique(grid_xy[:, 0])
+    gy = np.unique(grid_xy[:, 1])
+    nx, ny = len(gx), len(gy)
+    Zm = mean_hf.reshape(ny, nx)
+    Zs = std_hf.reshape(ny, nx)
+
+    # Take only the diagonal points
+    mean_points = Zm.diagonal()
+    std_points = Zs.diagonal()
+
+    # Scale the plotting on x axis to proportion of detector
+    max_x, max_y = max(gx), max(gy)
+    scaled_axis = gx/max_x
+    scaled_hf = hf_points / np.array([max_x, max_y])
+
+    fig, ax = plt.subplots(1, 2, figsize=(18, 8))
+    # Mean Plot
+    im1 = ax[0].plot(scaled_axis, mean_points)
+    ax[0].set_title("MF-GP Mean (HF)")
+    ax[0].set_ylabel("Prediction Mean")
+    
+    # STD Plot
+    im2 = ax[1].plot(scaled_axis, std_points)
+    ax[1].set_title("MF-GP STD (HF)")
+    ax[1].set_ylabel("Prediction STD")
+
+    for a in ax:
+        a.set_xlabel(r"Normalized detector position, $R/R_{\max}=Z/Z_{\max}$")
+        a.grid(alpha=0.25)
+    
+        if hf_points is not None and len(hf_points):
+            scaled_hf = hf_points[:,0] / max_x
+    
+            ymin, ymax = a.get_ylim()
+            rug_height = 0.05 * (ymax - ymin)
+    
+            a.vlines(
+                scaled_hf,
+                ymin=ymin,
+                ymax=ymin + rug_height,
+                color="k",
+                linewidth=1.2,
+                alpha=0.75,
+                label="HF validation points"
+            )
+    
+        a.legend()
+    
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
 
 def _plot_mean_std_heatmaps(
     grid_xy: np.ndarray,
@@ -1339,14 +1402,24 @@ def run_clean_mfgp(
 
     _plot_hf_observation_map(hf, runtime.theta_headers, data_plot)
     # Training-side parity plot intentionally omitted to reduce redundant outputs.
-    _plot_mean_std_heatmaps(
-        grid_xy,
-        grid_mean,
-        grid_std,
-        runtime.theta_headers,
-        hf_points=x_hf,
-        out_path=mean_std_plot,
-    )
+    if runtime.sim_type == "shell":
+        _plot_mean_std_linear(
+            grid_xy,
+            grid_mean,
+            grid_std,
+            runtime.theta_headers,
+            hf_points=x_hf,
+            out_path=mean_std_plot,
+        )
+    else:
+        _plot_mean_std_heatmaps(
+            grid_xy,
+            grid_mean,
+            grid_std,
+            runtime.theta_headers,
+            hf_points=x_hf,
+            out_path=mean_std_plot,
+        )
     interactive_3d_ok = _write_interactive_mean_std_surfaces_3d_html(
         grid_xy,
         grid_mean,
