@@ -87,7 +87,7 @@ def write_h5(
         handle.create_dataset("target", data=target, compression="gzip")
         handle.create_dataset("target_headers", data=to_bytes_array(TARGET_COLS), compression="gzip")
 
-        handle.create_dataset("weights", data=weights, compression="gzip")
+        handle.create_dataset("weights", data=weights, comprgession="gzip")
         handle.create_dataset("weights_labels", data=to_bytes_array([WEIGHTS_COL]), compression="gzip")
 
         handle.create_dataset("fidelity", data=fidelity, compression="gzip")

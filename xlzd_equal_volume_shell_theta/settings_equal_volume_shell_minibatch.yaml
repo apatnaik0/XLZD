@@ -17,6 +17,7 @@ cnp_settings:
   plot_after: 5000
 
 simulation_settings:
+  simulation_type: shell
   theta_headers: ["R_shell", "Z_shell"]
   phi_labels: ["s_r", "s_z_from_center"]
   target_headers: ["inside_shell"]

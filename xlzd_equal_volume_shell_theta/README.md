@@ -187,6 +187,10 @@ This does not guarantee strong inner HF coverage, but it makes it more likely th
   - CNP/MF-GP training config
 - [settings_equal_volume_shell_validation_minibatch.yaml](/Users/anishpatnaik/Documents/RareAI%20Lab/XLZD/xlzd_equal_volume_shell_theta/settings_equal_volume_shell_validation_minibatch.yaml)
   - validation prediction config
+- [predict_cnp_on_csv.py](/Users/anishpatnaik/Documents/RareAI%20Lab/XLZD/xlzd_equal_volume_shell_theta/predict_cnp_on_csv.py)
+  - runs a trained CNP checkpoint on a new source/event CSV
+  - uses existing empirical H5 files as the CNP context set
+  - writes event-wise CNP probabilities without rerunning the full pipeline
 - [00_equal_volume_shell_workflow.ipynb](/Users/anishpatnaik/Documents/RareAI%20Lab/XLZD/xlzd_equal_volume_shell_theta/00_equal_volume_shell_workflow.ipynb)
   - single baseline notebook with:
     - notebook-parameter override
@@ -217,6 +221,94 @@ The dataset directory is always:
 - `outputs_equal_volume_shell_theta`
 
 and the prep step now clears and rebuilds that folder each time. That avoids filling disk with stale experiment copies.
+
+## Predicting On A New CSV With A Trained CNP
+
+Use `predict_cnp_on_csv.py` when you already have a trained CNP model and want event-wise predictions for a new CSV of source points.
+
+This script does not train a model and does not rebuild the shell dataset. It:
+
+- reads a source/event CSV
+- derives or reads the CNP phi columns, usually `s_r` and `s_z_from_center`
+- attaches one or more theta queries, usually `R_shell` and `Z_shell`
+- samples empirical context rows from the existing H5 training directory
+- writes event-wise `y_cnp` and `y_cnp_err`
+
+Example for one shell-theta query:
+
+```bash
+python xlzd_equal_volume_shell_theta/predict_cnp_on_csv.py \
+  --input-csv path/to/source_points.csv \
+  --output-csv data/out/cnp/source_points_shell750_1000_predictions.csv \
+  --config xlzd_equal_volume_shell_theta/settings_equal_volume_shell_minibatch.yaml \
+  --theta 750 1000 \
+  --overwrite
+```
+
+If the model checkpoint is not at the default config-derived location, pass it explicitly:
+
+```bash
+python xlzd_equal_volume_shell_theta/predict_cnp_on_csv.py \
+  --input-csv path/to/source_points.csv \
+  --output-csv data/out/cnp/source_points_predictions.csv \
+  --config xlzd_equal_volume_shell_theta/settings_equal_volume_shell_minibatch.yaml \
+  --model-path data/out/cnp/cnp_xlzd_equal_volume_shell_v1_minibatch_model_15epochs.pth \
+  --theta 750 1000 \
+  --overwrite
+```
+
+For multiple theta queries, create a CSV with columns matching the config theta headers:
+
+```text
+R_shell,Z_shell
+500,667
+750,1000
+1000,1333
+```
+
+Then run:
+
+```bash
+python xlzd_equal_volume_shell_theta/predict_cnp_on_csv.py \
+  --input-csv path/to/source_points.csv \
+  --output-csv data/out/cnp/source_points_multi_shell_predictions.csv \
+  --theta-csv path/to/theta_queries.csv \
+  --overwrite
+```
+
+The input CSV can provide `s_r` and `s_z_from_center` directly. If not, the script tries to derive them from common source coordinate columns:
+
+- `s_r` from `s_r`, `r_start`, `source_r`, `r`, or from `sx/sy`
+- `s_z_from_center` from `s_z_from_center`, `z_start_from_center`, `source_z_from_center`, `z_from_center`, or from `sz - z_center`
+
+For source CSVs with columns such as:
+
+```text
+sx,sy,sz,E0,ETPC,x,y,z
+```
+
+the script uses:
+
+- `s_r = sqrt(sx^2 + sy^2)`
+- `s_z_from_center = abs(sz - z_center)`
+
+The `x,y,z` columns are not treated as predicted outputs by this CNP. They are ignored unless you explicitly include them in the output with `--include-input-columns`.
+
+To scan every equal-volume shell theta instead of passing one theta manually:
+
+```bash
+python xlzd_equal_volume_shell_theta/predict_cnp_on_csv.py \
+  --input-csv path/to/source_points.csv \
+  --output-csv data/out/cnp/source_points_all_shell_predictions.csv \
+  --config xlzd_equal_volume_shell_theta/settings_equal_volume_shell_minibatch.yaml \
+  --all-shells \
+  --include-input-columns \
+  --overwrite
+```
+
+`--all-shells` reads `R_max`, `Z_max`, and `n_shells` from `xlzd_equal_volume_shell_theta/config/pipeline_config.json` unless you override them with `--R-max`, `--Z-max`, or `--n-shells`.
+
+Important caveat: the CNP needs a context set. This script uses empirical H5 training files as the context, so synthetic CSV rows do not need known targets and do not contaminate the context.
 
 ## Notebook Parameters
 
