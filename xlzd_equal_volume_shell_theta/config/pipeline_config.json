@@ -20,7 +20,7 @@
   },
   "sampling": {
     "hf_block_size": 100000,
-    "lf_block_size": 10000,
+    "lf_block_size": 20000,
     "validation_block_size": null,
     "progress": true
   },
@@ -28,9 +28,10 @@
     "R_max": 1500.0,
     "Z_max": 2000.0,
     "n_shells": 100,
-    "min_candidate_events": 25,
+    "min_candidate_events": 5,
     "z_center": 1982.48,
-    "rounding_decimals": 6
+    "rounding_decimals": 6,
+    "negative_shells": 1
   },
   "output": {
     "output_dir": "outputs_equal_volume_shell_theta",

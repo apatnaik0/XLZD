@@ -62,6 +62,7 @@ class EqualVolumeShellConfig:
     min_candidate_events: int = 25
     z_center: float | None = 1982.48
     rounding_decimals: int = 6
+    negative_shells: int = 4
 
     def validate(self) -> None:
         if self.R_max <= 0 or self.Z_max <= 0:
@@ -72,6 +73,8 @@ class EqualVolumeShellConfig:
             raise ValueError("min_candidate_events must be positive.")
         if self.rounding_decimals < 0:
             raise ValueError("rounding_decimals must be non-negative.")
+        if self.negative_shells < 0:
+            raise ValueError("The number of negative shells must be non-negative")
 
 
 @dataclass(slots=True)
@@ -145,6 +148,7 @@ def build_config(args: argparse.Namespace) -> EqualVolumeShellPipelineConfig:
             min_candidate_events=int(shell.get("min_candidate_events", 25)),
             z_center=shell.get("z_center"),
             rounding_decimals=int(shell.get("rounding_decimals", 6)),
+            negative_shells=int(shell.get("negative_shells", 4))
         ),
         output=OutputConfig(
             output_dir=Path(output.get("output_dir", "outputs_equal_volume_shell_theta")),
@@ -266,6 +270,7 @@ def choose_shell_sets(
         raise ValueError("Need at least 2 valid shell candidates to assign LF and validation shells.")
 
     if available < requested_unique:
+        print("This shouldnt print")
         scale = available / float(requested_unique)
         shrunk_lf = max(2, min(n_lf, int(np.floor(n_lf * scale))))
         shrunk_validation = max(1, min(n_validation, available - shrunk_lf))
@@ -310,6 +315,75 @@ def choose_shell_sets(
     val_df["validation_shell_instance"] = np.arange(len(val_df))
     return lf_df, hf_df, val_df
 
+def positive_shells_for_block(
+    block_df: pd.DataFrame,
+    candidates_df: pd.DataFrame,
+) -> pd.DataFrame:
+    # Find all positive shells for a singular block
+    positive_rows = []
+    for row in candidates_df.itertuples(index=False):
+        mask = inside_equal_volume_shell(
+            block_df,
+            R_inner=float(row.R_inner),
+            Z_inner=float(row.Z_inner),
+            R_outer=float(row.R_shell),
+            Z_outer=float(row.Z_shell),
+        )
+        if int(mask.sum()) > 0:
+            positive_rows.append(row._asdict())
+    return pd.DataFrame(positive_rows)
+
+def build_pos_neg_shell_pairs(
+    *,
+    blocks: Sequence[pd.DataFrame],
+    candidates_df: pd.DataFrame,
+    num_neg_shells: int,
+    random_seed: int,
+) -> pd.DataFrame:
+    # Make dataframe that matches up positive shell and given number of negative shells
+    rng = np.random.default_rng(random_seed)
+    records: list[dict[str, float | int | str]] = []
+    all_shell_idxs = set(candidates_df["shell_index"].astype(int))
+
+    # Run through each block
+    for block_index, block_df in enumerate(blocks):
+        positive_df = positive_shells_for_block(block_df, candidates_df)
+        if positive_df.empty:
+            continue
+
+        # Make a record of the positive set
+        for positive_row in positive_df.itertuples(index=False):
+            positive_shell_idx = int(positive_row.shell_index)
+            record = positive_row._asdict()
+            record["block_index"] = block_index
+            record["pair_type"] = "positive"
+            record["random_seed_used"] = random_seed
+            records.append(record)
+
+            # Choose a certain number of negative sets
+            negative_shell_idxs = list(all_shell_idxs - {positive_shell_idx})
+            if num_neg_shells > len(negative_shell_idxs):
+                sampled_negative_indices = negative_shell_idxs
+            else:
+                sampled_negative_indices = rng.choice(
+                    negative_shell_idxs,
+                    size=num_neg_shells,
+                    replace=False,
+                )
+            negative_df = candidates_df[candidates_df["shell_index"].isin(sampled_negative_indices)]
+
+            # Make a record of each negative set
+            for negative_row in negative_df.itertuples(index=False):
+                record = negative_row._asdict()
+                record["block_index"] = block_index
+                record["pair_type"] = "negative"
+                record["random_seed_used"] = random_seed
+                records.append(record)
+                
+    if not records:
+        raise RuntimeError("No positive/negative shell pairs were created")
+    return pd.DataFrame.from_records(records).reset_index(drop=True)
+
 
 def _format_float_for_filename(value: float, decimals: int = 3) -> str:
     text = f"{value:.{decimals}f}"
@@ -318,6 +392,8 @@ def _format_float_for_filename(value: float, decimals: int = 3) -> str:
 
 def _build_shell_filename(
     fidelity: str,
+    pair_type: str,
+    block_index: int,
     shell_index: int,
     R_shell: float,
     Z_shell: float,
@@ -327,6 +403,8 @@ def _build_shell_filename(
 ) -> str:
     base = (
         f"{fidelity}_"
+        f"{pair_type}_"
+        f"block{block_index:04d}_"
         f"shell{shell_index:03d}_"
         f"R{_format_float_for_filename(R_shell)}_"
         f"Z{_format_float_for_filename(Z_shell)}"
@@ -343,22 +421,35 @@ def _build_shell_filename(
 def write_shell_block_files(
     *,
     blocks: Sequence[pd.DataFrame],
-    theta_df: pd.DataFrame,
+    pair_df: pd.DataFrame,
     split_name: str,
     fidelity: str,
     output_dir: Path,
     output_format: str,
 ) -> pd.DataFrame:
-    if len(blocks) != len(theta_df):
-        raise ValueError(f"Number of blocks and shell rows must match for {split_name}: {len(blocks)} != {len(theta_df)}")
+    used_blocks = set(pair_df["block_index"].astype(int))
+    expected_blocks = set(range(len(blocks)))
+    missing_blocks = expected_blocks - used_blocks
+    if missing_blocks:
+        print(
+            f"[warn] {len(missing_blocks)} blocks were never assigned a shell pair. "
+            f"Examples: {sorted(list(missing_blocks))[:10]}"
+        )
+    if len(used_blocks) == 0:
+        raise RuntimeError(
+            "No valid block-shell pairs were generated."
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     existing_names: set[str] = set()
     records: list[dict[str, float | int | str]] = []
     extension = output_format.lower()
 
-    for block_index, (block_df, row) in enumerate(zip(blocks, theta_df.itertuples(index=False), strict=True)):
+    for pair_index, row in enumerate(pair_df.itertuples(index=False)):
+        block_index = int(row.block_index)
+        block_df = blocks[block_index]
         out_df = block_df.copy()
+
         R_inner = float(row.R_inner)
         Z_inner = float(row.Z_inner)
         R_outer = float(row.R_shell)
@@ -367,11 +458,16 @@ def write_shell_block_files(
 
         out_df["split_name"] = split_name
         out_df["fidelity"] = fidelity
+        out_df["block_index"] = block_index
+        out_df["pair_index"] = pair_index
+        out_df["pair_type"] = row.pair_type
+
         out_df["shell_index"] = shell_index
         out_df["R_inner"] = R_inner
         out_df["Z_inner"] = Z_inner
         out_df["R_shell"] = R_outer
         out_df["Z_shell"] = Z_outer
+
         out_df[TARGET_COLUMN] = inside_equal_volume_shell(
             out_df,
             R_inner=R_inner,
@@ -379,9 +475,11 @@ def write_shell_block_files(
             R_outer=R_outer,
             Z_outer=Z_outer,
         ).astype(np.int8)
-
+        
         filename = _build_shell_filename(
             fidelity=fidelity,
+            pair_type=row.pair_type,
+            block_index=block_index,
             shell_index=shell_index,
             R_shell=R_outer,
             Z_shell=Z_outer,
@@ -393,6 +491,8 @@ def write_shell_block_files(
         inside_count = int(out_df[TARGET_COLUMN].sum())
         records.append(
             {
+                "pair_index": int(pair_index),
+                "pair_type": str(row.pair_type),
                 "block_index": int(block_index),
                 "random_seed_used": int(row.random_seed_used),
                 "split_name": split_name,
@@ -488,22 +588,36 @@ def main() -> None:
     candidates_df = build_shell_candidate_table(pools.lf_pool, config.shell)
     finish_stage(stage_start, f"Built {len(candidates_df)} valid shell candidates")
 
-    stage_start = log_stage("Assigning shell bands to LF/HF/validation blocks")
-    lf_shell_df, hf_shell_df, validation_shell_df = choose_shell_sets(
-        candidates_df,
-        n_lf=len(lf_blocks.blocks),
-        n_hf=len(hf_blocks.blocks),
-        n_validation=len(validation_blocks.blocks),
+    stage_start = log_stage("Assigning positive/negative shell pairs to LF/HF/Validation Blocks")
+    lf_pair_df = build_pos_neg_shell_pairs(
+        blocks=lf_blocks.blocks,
+        candidates_df=candidates_df,
+        num_neg_shells=config.shell.negative_shells,
         random_seed=config.split.random_seed,
     )
-    finish_stage(
-        stage_start,
-        f"Assigned n={len(lf_shell_df)} LF shells, m={len(hf_shell_df)} HF shells, k={len(validation_shell_df)} validation shells",
+    hf_pair_df = build_pos_neg_shell_pairs(
+        blocks=hf_blocks.blocks,
+        candidates_df=candidates_df,
+        num_neg_shells=config.shell.negative_shells,
+        random_seed=config.split.random_seed + 1,
+    )
+    validation_pair_df = build_pos_neg_shell_pairs(
+        blocks=validation_blocks.blocks,
+        candidates_df=candidates_df,
+        num_neg_shells=config.shell.negative_shells,
+        random_seed=config.split.random_seed + 2,
     )
 
-    lf_blocks_list = list(lf_blocks.blocks[: len(lf_shell_df)])
-    hf_blocks_list = list(hf_blocks.blocks[: len(hf_shell_df)])
-    validation_blocks_list = list(validation_blocks.blocks[: len(validation_shell_df)])
+    finish_stage(
+        stage_start,
+        f"Assigned {len(lf_pair_df)} LF pairs, "
+        f"{len(hf_pair_df)} HF pairs, "
+        f"{len(validation_pair_df)} validation pairs"
+    )
+
+    lf_blocks_list = list(lf_blocks.blocks)
+    hf_blocks_list = list(hf_blocks.blocks)
+    validation_blocks_list = list(validation_blocks.blocks)
 
     output_dir = config.output.output_dir
     output_format = config.output.output_format
@@ -516,7 +630,7 @@ def main() -> None:
     stage_start = log_stage("Writing LF equal-volume shell block files")
     lf_manifest = write_shell_block_files(
         blocks=lf_blocks_list,
-        theta_df=lf_shell_df,
+        pair_df=lf_pair_df,
         split_name="training",
         fidelity="lf",
         output_dir=output_dir / "training" / "lf",
@@ -527,7 +641,7 @@ def main() -> None:
     stage_start = log_stage("Writing HF training equal-volume shell block files")
     hf_manifest = write_shell_block_files(
         blocks=hf_blocks_list,
-        theta_df=hf_shell_df,
+        pair_df=hf_pair_df,
         split_name="training",
         fidelity="hf",
         output_dir=output_dir / "training" / "hf",
@@ -538,7 +652,7 @@ def main() -> None:
     stage_start = log_stage("Writing HF validation equal-volume shell block files")
     validation_manifest = write_shell_block_files(
         blocks=validation_blocks_list,
-        theta_df=validation_shell_df,
+        pair_df=validation_pair_df,
         split_name="validation",
         fidelity="hf",
         output_dir=output_dir / "validation" / "hf",
