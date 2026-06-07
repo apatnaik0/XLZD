@@ -20,32 +20,19 @@
   },
   "sampling": {
     "hf_block_size": 100000,
-<<<<<<< Updated upstream
     "lf_block_size": 20000,
     "validation_block_size": null,
     "progress": true
-=======
-    "lf_block_size": 100000,
-    "validation_block_size": null,
-    "progress": true,
-    "negative_shells": 2
->>>>>>> Stashed changes
   },
   "shell": {
     "R_max": 1500.0,
     "Z_max": 2000.0,
-<<<<<<< Updated upstream
-    "n_shells": 80,
-    "min_candidate_events": 5,
-    "z_center": 1982.48,
-    "rounding_decimals": 6
-=======
     "n_shells": 100,
     "min_candidate_events": 1,
     "z_center": 1982.48,
     "rounding_decimals": 6,
-    "negative_shells": 1
->>>>>>> Stashed changes
+    "negative_shells": 4,
+    "scale_power": 0.3333333333333333
   },
   "output": {
     "output_dir": "outputs_equal_volume_shell_theta",

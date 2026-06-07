@@ -31,7 +31,8 @@
     "min_candidate_events": 5,
     "z_center": 1982.48,
     "rounding_decimals": 6,
-    "negative_shells": 1
+    "negative_shells": 1,
+    "scale_power": 0.3333333
   },
   "output": {
     "output_dir": "outputs_equal_volume_shell_theta",

@@ -43,6 +43,10 @@ class CNPRuntimeConfig:
     predict_iterations: List[int]
     predict_fidelities: List[int]
     out_dir: Path
+    R_max: float
+    Z_max: float
+    n_shells: int
+    scale_power: float
     theta_headers: List[str]
     theta_min: List[float]
     theta_max: List[float]
@@ -110,6 +114,10 @@ def load_runtime_config(config_path: str | Path, seed: int = 42) -> CNPRuntimeCo
         predict_iterations=predict_iterations,
         predict_fidelities=predict_fidelities,
         out_dir=_resolve_path(paths.get("path_out_cnp", "../../data/out/cnp"), base),
+        R_max=float(sim.get("R_max", 1500.0)),
+        Z_max=float(sim.get("Z_max", 2000.0)),
+        n_shells=int(sim.get("n_shells", 100)),
+        scale_power=float(sim.get("scale_power", 1.0/3.0)),
         theta_headers=list(sim.get("theta_headers", ["R_max", "Z_max"])),
         theta_min=[float(x) for x in sim.get("theta_min", [0.0, 0.0])],
         theta_max=[float(x) for x in sim.get("theta_max", [1.0, 1.0])],
@@ -155,16 +163,21 @@ class EventBatch:
 class H5EventPool:
     """Event sampler across multiple H5 files.
 
-    Features x = [theta, phi], target y = target headers.
-    """
+    Each H5 File contains:
+        theta:  (N, theta_dim) -> Current Theta: (R_shell, Z_shell) -> theta_dim = 2
+        phi:    (N, phi_dim) -> Current Phi: (s_r, s_z_from_center) -> phi_dim = 2
+        target: (N, target_dim) -> Current targets: (0 or 1) -> target_dim = 1
 
+    The model I/O is: 
+        x = [theta, phi]
+        y = target
+    """
     def __init__(
         self,
         directory: str | Path,
         theta_headers: Sequence[str],
         phi_headers: Sequence[str],
         target_headers: Sequence[str],
-        use_mixedup: bool = False,
         seed: int = 42,
         cache_files: bool = True,
     ) -> None:
@@ -172,7 +185,6 @@ class H5EventPool:
         self.theta_headers = list(theta_headers)
         self.phi_headers = list(phi_headers)
         self.target_headers = list(target_headers)
-        self.use_mixedup = bool(use_mixedup)
         self.rng = np.random.default_rng(seed)
         self.cache_files = cache_files
         self._cache: Dict[Path, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -185,32 +197,41 @@ class H5EventPool:
             raise FileNotFoundError(f"No .h5 files found in {self.directory}")
 
     def _decode_labels(self, arr: np.ndarray) -> List[str]:
-        out = []
+        labels: List[str] = []
         for item in arr:
-            out.append(item.decode("utf-8") if isinstance(item, (bytes, np.bytes_)) else str(item))
-        return out
-
+            labels.append(item.decode("utf-8") if isinstance(item, (bytes, np.bytes_)) else str(item))
+        return labels
+    
     def _load_one(self, file_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.cache_files and file_path in self._cache:
             return self._cache[file_path]
 
         with h5py.File(file_path, "r") as f:
+            # Load theta, phi, target
             theta = np.asarray(f["theta"], dtype=np.float32)
-            phi_key = "phi_mixedup" if self.use_mixedup and "phi_mixedup" in f else "phi"
-            target_key = "target_mixedup" if self.use_mixedup and "target_mixedup" in f else "target"
+            phi = np.asarray(f["phi"], dtype=np.float32)
+            target = np.asarray(f["target"], dtype=np.float32)
 
-            phi = np.asarray(f[phi_key], dtype=np.float32)
-            target = np.asarray(f[target_key], dtype=np.float32)
-            if self.use_mixedup and (len(phi) == 0 or len(target) == 0):
-                # Fallback to original datasets when mixup is unavailable/empty for this file.
-                phi = np.asarray(f["phi"], dtype=np.float32)
-                target = np.asarray(f["target"], dtype=np.float32)
-
-            if theta.ndim != 1:
-                theta = np.asarray(theta[0], dtype=np.float32)
-            if target.ndim == 1:
+            # Checks
+            # If target = (N,) -> (N, 1)
+            if target.ndim == 1: 
                 target = target.reshape(-1, 1)
-
+            # Checks theta = (N, theta_dim)
+            if theta.ndim != 2:
+                raise ValueError(f"{file_path.name}: expected theta shape (N, theta_dim) got {theta.shape}")
+            # Checks phi = (N, phi_dim)
+            if phi.ndim != 2:
+                raise ValueError(f"{file_path.name}: expected phi shape (N, phi_dim), got {phi.shape}")
+            # Checks target = (N, target_dim)
+            if target.ndim != 2:
+                raise ValueError(f"{file_path.name}: expected target shape (N, target_dim), got {target.shape}")
+            # Checks all are the same length (since each event has a theta, phi, target they should all be the same)
+            if len(theta) != len(phi) or len(theta) != len(target):
+                raise ValueError(
+                    f"{file_path.name}: row count mismatch: "
+                    f"theta={len(theta)}, phi={len(phi)}, target={len(target)}"
+                )
+                
             # Optional label validation when available.
             if "theta_headers" in f:
                 labels = self._decode_labels(np.asarray(f["theta_headers"]))
@@ -243,12 +264,19 @@ class H5EventPool:
             return self._row_count_cache[file_path]
 
         with h5py.File(file_path, "r") as f:
-            target_key = "target_mixedup" if self.use_mixedup and "target_mixedup" in f else "target"
-            n_rows = int(f[target_key].shape[0])
+            n_rows = int(f["target"].shape[0])
 
         self._row_count_cache[file_path] = n_rows
         return n_rows
 
+    def _choose_files(self, files_per_batch: int) -> List[Path]:
+        k = min(files_per_batch, len(self.files))
+
+        if k == len(self.files):
+            return self.files
+        idx = self.rng.choice(len(self.files), size=k, replace=False)
+        return [self.files[i] for i in idx]
+        
     def sample_batch(self, batch_size: int, files_per_batch: int) -> EventBatch:
         chosen = self._choose_files(files_per_batch)
         per_file = max(1, batch_size // len(chosen))
@@ -260,11 +288,12 @@ class H5EventPool:
             theta, phi, target = self._load_one(f)
             n = len(target)
             if n == 0:
-                continue
+                continue        
             idx = self.rng.integers(0, n, size=per_file)
-            theta_rep = np.repeat(theta.reshape(1, -1), repeats=per_file, axis=0)
-            x = np.hstack([theta_rep, phi[idx]])
-            y = target[idx]
+
+            x = np.hstack([theta[idx], phi[idx]]).astype(np.float32)
+            y = target[idx].astype(np.float32)
+            
             xs.append(x)
             ys.append(y)
 
@@ -284,7 +313,6 @@ class H5EventPool:
         drop_last: bool = False,
     ) -> Iterable[EventBatch]:
         """Yield batches so every event row is seen once per epoch."""
-
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
         if files_per_batch <= 0:
@@ -341,8 +369,7 @@ class H5EventPool:
                 n = len(target)
                 if n == 0:
                     continue
-                theta_rep = np.repeat(theta.reshape(1, -1), repeats=n, axis=0)
-                x = np.hstack([theta_rep, phi]).astype(np.float32)
+                x = np.hstack([theta, phi]).astype(np.float32)
                 y = target.astype(np.float32)
                 if shuffle and n > 1:
                     perm = self.rng.permutation(n)
@@ -365,18 +392,9 @@ class H5EventPool:
     def iter_file_data(self) -> Iterable[Tuple[Path, np.ndarray, np.ndarray, np.ndarray]]:
         for f in self.files:
             theta, phi, target = self._load_one(f)
-            theta_rep = np.repeat(theta.reshape(1, -1), repeats=len(target), axis=0)
-            x = np.hstack([theta_rep, phi]).astype(np.float32)
+            x = np.hstack([theta, phi]).astype(np.float32)
             y = target.astype(np.float32)
             yield f, x, y, theta.astype(np.float32)
-
-    def _choose_files(self, files_per_batch: int) -> List[Path]:
-        k = min(files_per_batch, len(self.files))
-        if k == len(self.files):
-            return self.files
-        idx = self.rng.choice(len(self.files), size=k, replace=False)
-        return [self.files[i] for i in idx]
-
 
 # -----------------------------
 # CNP model
@@ -630,16 +648,12 @@ def train_cnp(
 ) -> TrainResult:
     runtime.out_dir.mkdir(parents=True, exist_ok=True)
     set_seed(runtime.seed)
-    use_mixup = str(runtime.use_data_augmentation).strip().lower() == "mixup"
-    if use_mixup:
-        print("Training with mixup datasets: phi_mixedup / target_mixedup (if present).")
 
     pool = H5EventPool(
         runtime.train_dir,
         theta_headers=runtime.theta_headers,
         phi_headers=runtime.phi_headers,
         target_headers=runtime.target_headers,
-        use_mixedup=use_mixup,
         seed=runtime.seed,
         cache_files=True,
     )
@@ -1007,12 +1021,70 @@ def _plot_prediction_heatmaps(
     fig2.savefig(err_out_path, dpi=180)
     plt.close(fig2)
 
+def read_h5_meta(file_path: Path) -> dict[str, np.ndarray]:
+    meta: dict[str, np.ndarray] = {}
+    with h5py.File(file_path, "r") as f:
+        if "meta" not in f:
+            return meta
+        for key in f["meta"].keys():
+            meta[key] = np.asarray(f["meta"][key])
+    return meta
+
+def shell_boundaries(r_max: float, z_max:float , shells: int, power: float) -> pd.DataFrame:
+    idx = np.arange(0, shells + 1, dtype=float)
+    frac = idx / float(shells)
+    scale = frac ** power
+    r = r_max * scale
+    z = z_max * scale
+    return pd.DataFrame(
+        {
+            "shell_level": idx.astype(int),
+            "R": r.astype(float),
+            "Z": z.astype(float),
+        }
+    )
+
+def full_shell_table(r_max: float, z_max:float , shells: int, power: float) -> pd.DataFrame:
+    boundaries = shell_boundaries(r_max, z_max, shells, power)
+    rows: list[dict[str, float | int]] = []
+
+    for i in range(1, shells + 1):
+        prev=boundaries.iloc[i-1]
+        curr=boundaries.iloc[i]
+
+        rows.append({
+            "shell_index": int(i),
+            "R_inner": float(prev["R"]),
+            "Z_inner": float(prev["Z"]),
+            "R_shell": float(curr["R"]),
+            "Z_shell": float(curr["Z"])
+        })
+
+    return pd.DataFrame(rows)
+
+def unique_events_from_h5_file(
+    file_path: Path,
+    phi_headers: Sequence[str],
+) -> pd.DataFrame:
+    with h5py.File(file_path, "r") as f:
+        phi = np.asarray(f["phi"], dtype=np.float32)
+    meta = read_h5_meta(file_path)
+
+    if "event_index" in meta:
+        event_index = meta["event_index"].astype(np.int64)
+    else:
+        event_index = np.arange(len(phi), dtype=np.int64)
+
+    event_df = pd.DataFrame(phi, columns=phi_headers)
+    event_df["event_index"] = event_index
+
+    return event_df.drop_duplicates(subset=["event_index"]).sort_values("event_index").reset_index(drop=True)
 
 def predict_cnp(
     runtime: CNPRuntimeConfig,
     model_path: str | Path,
     mc_samples: int = 30,
-    output_suffix: Optional[str] = None,
+    output_suffix: Optional[str] = "event_shell_distribution",
     output_epochs: Optional[int] = None,
     chunk_size: int = 20000,
     device: Optional[str] = None,
@@ -1024,12 +1096,15 @@ def predict_cnp(
     model = load_model_checkpoint(model_path, device=device)
     dev = next(model.parameters()).device
 
-    if output_suffix is None:
-        first = str(runtime.predict_dirs[0]).lower() if runtime.predict_dirs else ""
-        output_suffix = "output_validation" if "validation" in first else "output"
     if output_epochs is None:
         output_epochs = runtime.epochs
 
+    r_max, z_max, shells, power = runtime.R_max, runtime.Z_max, runtime.n_shells, runtime.scale_power
+    shell_table = full_shell_table(r_max, z_max, shells, power)
+    shell_theta = shell_table[list(runtime.theta_headers)].to_numpy(dtype=np.float32)
+    shell_indices = shell_table["shell_index"].to_numpy(dtype=np.int32)
+    n_shells = len(shell_table)
+    
     rows: List[Dict[str, float]] = []
 
     for i, pred_dir in enumerate(runtime.predict_dirs):
@@ -1058,89 +1133,108 @@ def predict_cnp(
             context_x = torch.from_numpy(x_np[c_idx]).to(dev)
             context_y = torch.from_numpy(y_np[c_idx]).to(dev)
 
-            # Predict in chunks to control memory.
-            mu_parts: List[np.ndarray] = []
-            std_parts: List[np.ndarray] = []
-            with torch.no_grad():
-                for start in range(0, n, chunk_size):
-                    end = min(n, start + chunk_size)
-                    tx = torch.from_numpy(x_np[start:end]).to(dev)
-                    mu_t, std_t = model.predict_proba_mc(context_x, context_y, tx, mc_samples=mc_samples)
-                    mu_parts.append(mu_t.cpu().numpy())
-                    std_parts.append(std_t.cpu().numpy())
+            event_df = unique_events_from_h5_file(
+                file_path=file_path,
+                phi_headers=runtime.phi_headers,
+            )
+            event_phi = event_df[list(runtime.phi_headers)].to_numpy(dtype=np.float32)
+            event_indices = event_df["event_index"].to_numpy(dtype=np.int64)
+            events_per_chunk = max(1, chunk_size // n_shells)
+            file_parts: list[pd.DataFrame] = []
 
-            mu = np.vstack(mu_parts).reshape(-1, 1)
-            std = np.vstack(std_parts).reshape(-1, 1)
+            for event_start in range(0, len(event_df), events_per_chunk):
+                event_end = min(len(event_df), event_start+events_per_chunk)
 
-            y_raw = y_np.reshape(-1, 1)
-            row = {
-                "iteration": float(iteration),
-                "fidelity": float(fidelity),
-                "n_samples": float(n),
-                runtime.theta_headers[0]: float(theta_np[0]),
-                runtime.theta_headers[1]: float(theta_np[1]),
-                "y_cnp": float(mu.mean()),
-                "y_cnp_err": float(np.sqrt(np.mean(np.square(std)))),
-                "y_raw": float(y_raw.mean()),
-                "log_prop": _safe_log_bernoulli(y_raw, mu),
-                "bce": _bce_numpy(y_raw, mu),
-                "source_file": file_path.name,
+                phi_chunk = event_phi[event_start:event_end]
+                event_index_chunk = event_indices[event_start:event_end]
+                n_events_chunk = len(phi_chunk)
+
+                theta_expanded = np.tile(shell_theta, (n_events_chunk, 1))
+                phi_expanded = np.repeat(phi_chunk, repeats=n_shells, axis=0)
+
+                x_target_np = np.hstack([theta_expanded, phi_expanded]).astype(np.float32)
+                mu_parts: list[np.ndarray] = []
+                std_parts: list[np.ndarray] = []
+
+                with torch.no_grad():
+                    for row_start in range(0, len(x_target_np), chunk_size):
+                        row_end = min(len(x_target_np), row_start + chunk_size)
+
+                        target_x = torch.from_numpy(x_target_np[row_start:row_end]).to(dev)
+
+                        mu_t, std_t = model.predict_proba_mc(
+                            context_x,
+                            context_y,
+                            target_x,
+                            mc_samples=mc_samples,
+                        )
+
+                        mu_parts.append(mu_t.cpu().numpy())
+                        std_parts.append(std_t.cpu().numpy())
+                mu = np.vstack(mu_parts).reshape(-1)
+                std = np.vstack(std_parts).reshape(-1)
+
+                out = pd.DataFrame({
+                        "iteration": float(iteration),
+                        "fidelity": float(fidelity),
+                        "source_file": file_path.name,
+                        "event_index": np.repeat(event_index_chunk, repeats=n_shells),
+                        "shell_index": np.tile(shell_indices, reps=n_events_chunk),
+                        "y_cnp": mu,
+                        "y_cnp_err": std,
+                    })
+                for theta_col_idx, theta_name in enumerate(runtime.theta_headers):
+                    out[theta_name] = theta_expanded[:, theta_col_idx]
+
+                file_parts.append(out)
+                
+            if file_parts:
+                rows.append(pd.concat(file_parts, ignore_index=True))
+
+    if rows:
+        df = pd.concat(rows, ignore_index=True)
+
+        prob_sum = df.groupby("event_index")["y_cnp"].transform("sum")
+        df["p_shell"] = np.where(
+            prob_sum > 0,
+            df["y_cnp"] / prob_sum,
+            0.0,
+        )
+
+        best_idx = df.groupby("event_index")["p_shell"].idxmax()
+
+        best_df = df.loc[best_idx].copy()
+        best_df = best_df.rename(
+            columns={
+                "shell_index": "predicted_shell_index",
+                "p_shell": "predicted_shell_probability",
+                "y_cnp": "predicted_shell_score",
             }
-            rows.append(row)
-
-    out_csv = runtime.out_dir / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs.csv"
-    df = pd.DataFrame(rows)
-
-    required_cols = [
-        "iteration",
-        "fidelity",
-        "n_samples",
-        *runtime.theta_headers,
-        "y_cnp",
-        "y_cnp_err",
-        "y_raw",
-        "log_prop",
-        "bce",
-        "source_file",
-    ]
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-    df = df[required_cols]
-    df.to_csv(out_csv, index=False)
-
-    heatmap = runtime.out_dir / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs_heatmaps.png"
-    error_heatmap = runtime.out_dir / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs_error_heatmap.png"
-    if len(df) > 0:
-        _plot_prediction_heatmaps(
-            df,
-            runtime.theta_headers,
-            heatmap,
-            error_heatmap,
         )
     else:
-        plt.figure(figsize=(6, 4))
-        plt.text(0.5, 0.5, "No prediction rows generated", ha="center", va="center")
-        plt.axis("off")
-        plt.tight_layout()
-        plt.savefig(heatmap, dpi=120)
-        plt.close()
+        df = pd.DataFrame()
+        best_df = pd.DataFrame()
 
-        plt.figure(figsize=(6, 4))
-        plt.text(0.5, 0.5, "No prediction rows generated", ha="center", va="center")
-        plt.axis("off")
-        plt.tight_layout()
-        plt.savefig(error_heatmap, dpi=120)
-        plt.close()
+    all_shell_csv = (
+        runtime.out_dir
+        / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs_all_shells.csv"
+    )
+    best_shell_csv = (
+        runtime.out_dir
+        / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs_best_shell.csv"
+    )
+    df.to_csv(all_shell_csv, index=False)
+    best_df.to_csv(best_shell_csv, index=False)
 
-    if len(df):
-        mae = float(np.mean(np.abs(df["y_cnp"].to_numpy() - df["y_raw"].to_numpy())))
-        rmse = float(np.sqrt(np.mean((df["y_cnp"].to_numpy() - df["y_raw"].to_numpy()) ** 2)))
-        print(f"Prediction summary: rows={len(df)}, MAE={mae:.6f}, RMSE={rmse:.6f}")
+    print(f"Saved all event-shell probabilities: {all_shell_csv}")
+    print(f"Saved best shell per event: {best_shell_csv}")
 
-    return PredictResult(csv_path=out_csv, heatmap_path=heatmap, error_heatmap_path=error_heatmap)
-
-
+    return PredictResult(
+        csv_path=all_shell_csv,
+        heatmap_path=best_shell_csv,
+        error_heatmap_path=best_shell_csv,
+    )
+    
 # -----------------------------
 # Experiment wrappers
 # -----------------------------
