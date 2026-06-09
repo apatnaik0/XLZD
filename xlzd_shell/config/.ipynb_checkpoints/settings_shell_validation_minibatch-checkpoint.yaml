@@ -25,7 +25,6 @@ simulation_settings:
   Z_max: 2000.0
   n_shells: 100
   scale_power: 0.3333333333333333
-  negative_shells: 4
   theta_headers:
   - R_shell
   - Z_shell
@@ -52,19 +51,17 @@ simulation_settings:
   - 1000.0
   lf_cost: 1
   hf_cost: 10
+  negative_shells: 4
 path_settings:
-  version: xlzd_equal_volume_shell_v1_minibatch
-  path_to_files_train: ../outputs_equal_volume_shell_theta/training/lf
+  version: xlzd_shell_v1_minibatch
+  path_to_files_train: ../../shell_outputs/training/lf
   path_to_files_predict:
-  - ../outputs_equal_volume_shell_theta/training/lf
-  - ../outputs_equal_volume_shell_theta/training/hf
+  - ../../shell_outputs/validation/hf
   iteration:
   - 0
-  - 0
   fidelity:
-  - 0
   - 1
-  path_to_files_validation: ../data/out/cnp/cnp_xlzd_equal_volume_shell_v1_minibatch_output_validation_15epochs.csv
-  path_out_cnp: ../data/out/cnp
-  path_out_mfgp: ../data/out/mfgp
-  path_out_pce: ../data/out/pce
+  path_to_files_validation: ../../data/out/cnp/cnp_xlzd_shell_v1_minibatch_output_validation_15epochs.csv
+  path_out_cnp: ../../data/out/cnp
+  path_out_mfgp: ../../data/out/mfgp
+  path_out_pce: ../../data/out/pce

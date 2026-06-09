@@ -1,4 +1,4 @@
-# Equal-Volume Cylindrical Shell Theta
+# Cylindrical Shell Theta
 
 This folder contains a centered cylindrical shell-theta experiment that is separate from the original cumulative-volume theta pipeline and separate from the earlier local shell-grid experiment in [`xlzd_shell_theta`](/Users/anishpatnaik/Documents/RareAI%20Lab/XLZD/xlzd_shell_theta).
 
