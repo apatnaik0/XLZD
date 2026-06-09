@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-
+from tqdm.auto import tqdm
 
 # -----------------------------
 # Configuration and utilities
@@ -47,6 +47,7 @@ class CNPRuntimeConfig:
     Z_max: float
     n_shells: int
     scale_power: float
+    negative_shells: float
     theta_headers: List[str]
     theta_min: List[float]
     theta_max: List[float]
@@ -118,6 +119,7 @@ def load_runtime_config(config_path: str | Path, seed: int = 42) -> CNPRuntimeCo
         Z_max=float(sim.get("Z_max", 2000.0)),
         n_shells=int(sim.get("n_shells", 100)),
         scale_power=float(sim.get("scale_power", 1.0/3.0)),
+        negative_shells=int(sim.get("negative_shells", 4)),
         theta_headers=list(sim.get("theta_headers", ["R_max", "Z_max"])),
         theta_min=[float(x) for x in sim.get("theta_min", [0.0, 0.0])],
         theta_max=[float(x) for x in sim.get("theta_max", [1.0, 1.0])],
@@ -500,13 +502,11 @@ class TrainResult:
     history_plot: Path
     sample_plot: Path
 
-
 @dataclass
 class PredictResult:
-    csv_path: Path
-    heatmap_path: Path
-    error_heatmap_path: Path
-
+    all_path: Path
+    best_path: Path
+    mfgp_path: Path
 
 def split_context_target(
     x: torch.Tensor,
@@ -694,6 +694,9 @@ def train_cnp(
             f"Each epoch uses {effective_steps_per_epoch} sampled steps."
         )
 
+    #k = runtime.negative_shells
+    #pos_weight = torch.tensor([k], dtype=torch.float32, device=dev)
+    
     for epoch in range(runtime.epochs):
         model.train()
         epoch_steps = 0
@@ -1099,15 +1102,61 @@ def predict_cnp(
     if output_epochs is None:
         output_epochs = runtime.epochs
 
+    # Get the shell table for all shells
     r_max, z_max, shells, power = runtime.R_max, runtime.Z_max, runtime.n_shells, runtime.scale_power
     shell_table = full_shell_table(r_max, z_max, shells, power)
     shell_theta = shell_table[list(runtime.theta_headers)].to_numpy(dtype=np.float32)
     shell_indices = shell_table["shell_index"].to_numpy(dtype=np.int32)
     n_shells = len(shell_table)
-    
-    rows: List[Dict[str, float]] = []
 
+    # MFGP focused csv output
+    mfgp_csv = (
+        runtime.out_dir / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs.csv"
+    )
+    
+    # Diagnostic csv outputs
+    all_shell_csv = (
+        runtime.out_dir / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs_all_shells.csv"
+    )
+    best_shell_csv = (
+        runtime.out_dir
+        / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs_best_shell.csv"
+    )
+    for path in [mfgp_csv, all_shell_csv, best_shell_csv]:
+        if path.exists():
+            path.unlink()
+            
+    write_all_header = True
+    write_best_header = True
+    total_event_count = 0
+    total_pair_count = 0
+
+    agg_chunks: list[pd.DataFrame] = []
+
+    print("\n" + "=" * 80)
+    print("Starting CNP prediction")
+    print(f"MFGP CSV:       {mfgp_csv}")
+    print(f"All-shell CSV:  {all_shell_csv}")
+    print(f"Best-shell CSV: {best_shell_csv}")
+    print("=" * 80)
+    
     for i, pred_dir in enumerate(runtime.predict_dirs):
+        # Log datatype being run
+        pred_dir_str = str(pred_dir).lower()
+        if "validation" in pred_dir_str:
+            if "hf" in pred_dir_str:
+                dataset_type = "VAL-HF"
+            elif "lf" in pred_dir_str:
+                dataset_type = "VAL-LF"
+            else:
+                dataset_type = "VAL"
+        elif "hf" in pred_dir_str:
+            dataset_type = "TRAIN-HF"
+        elif "lf" in pred_dir_str:
+            dataset_type = "TRAIN-LF"
+        else:
+            dataset_type = "UNKNOWN"
+        
         fidelity = runtime.predict_fidelities[i]
         iteration = runtime.predict_iterations[i]
 
@@ -1117,122 +1166,249 @@ def predict_cnp(
             phi_headers=runtime.phi_headers,
             target_headers=runtime.target_headers,
             seed=runtime.seed + i,
-            cache_files=True,
+            cache_files=False,
         )
 
-        for file_path, x_np, y_np, theta_np in pool.iter_file_data():
-            n = len(y_np)
-            if n == 0:
-                continue
+        # Setup tqdm progress bar
+        files = list(Path(pred_dir).glob("*.h5"))
+        with tqdm(total=len(files), desc=f"{dataset_type}", unit="block") as pbar:
+            for file_path, x_np, y_np, theta_np in pool.iter_file_data():
+                n = len(y_np)
+                if n == 0:
+                    pbar.update(1)
+                    continue
 
-            rng = np.random.default_rng(runtime.seed + i + n)
-            n_context = max(2, int(runtime.context_ratio * n))
-            n_context = min(n_context, n - 1)
-            c_idx = rng.choice(n, size=n_context, replace=False)
+                # Build context from sampled event-shell rows in this file
+                rng = np.random.default_rng(runtime.seed + i + n)
+                n_context = max(2, int(runtime.context_ratio * n))
+                n_context = min(n_context, n - 1)
+                c_idx = rng.choice(n, size=n_context, replace=False)
+    
+                context_x = torch.from_numpy(x_np[c_idx]).to(dev)
+                context_y = torch.from_numpy(y_np[c_idx]).to(dev)
 
-            context_x = torch.from_numpy(x_np[c_idx]).to(dev)
-            context_y = torch.from_numpy(y_np[c_idx]).to(dev)
+                # Recover true positive shell per event from metadata
+                meta = read_h5_meta(file_path)
+                if "event_index" not in meta:
+                    raise ValueError(f"{file_path.name}: missing meta/event_index")
+                true_shell_lookup: dict[int, int] = {}
+                if "event_index" in meta and "shell_index" in meta and "pair_type" in meta:
+                    meta_event_index = meta["event_index"].astype(np.int64)
+                    meta_shell_index = meta["shell_index"].astype(np.int32)
+                    pair_type_raw = meta["pair_type"]
+                    pair_type = np.array(
+                        [
+                            x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x)
+                            for x in pair_type_raw
+                        ]
+                    )
+                    positive_mask = pair_type == "positive"
+                    true_shell_lookup = dict(
+                        zip(
+                            meta_event_index[positive_mask],
+                            meta_shell_index[positive_mask],
+                        )
+                    )
+                    
+                # Grab event wise data
+                event_df = unique_events_from_h5_file(
+                    file_path=file_path,
+                    phi_headers=runtime.phi_headers,
+                )
+                event_phi = event_df[list(runtime.phi_headers)].to_numpy(dtype=np.float32)
+                event_indices = event_df["event_index"].to_numpy(dtype=np.int64)
+                events_per_chunk = max(1, chunk_size // n_shells)
+    
+                for event_start in range(0, len(event_df), events_per_chunk):
+                    event_end = min(len(event_df), event_start+events_per_chunk)
+    
+                    phi_chunk = event_phi[event_start:event_end]
+                    event_index_chunk = event_indices[event_start:event_end]
+                    n_events_chunk = len(phi_chunk)
+    
+                    if n_events_chunk == 0:
+                        continue
 
-            event_df = unique_events_from_h5_file(
-                file_path=file_path,
-                phi_headers=runtime.phi_headers,
-            )
-            event_phi = event_df[list(runtime.phi_headers)].to_numpy(dtype=np.float32)
-            event_indices = event_df["event_index"].to_numpy(dtype=np.int64)
-            events_per_chunk = max(1, chunk_size // n_shells)
-            file_parts: list[pd.DataFrame] = []
+                    true_shell_chunk = np.array(
+                        [
+                            true_shell_lookup.get(int(event_index), -1)
+                            for event_index in event_index_chunk
+                        ],
+                        dtype=np.int32,
+                    )
+                    
+                    theta_expanded = np.tile(shell_theta, (n_events_chunk, 1))
+                    phi_expanded = np.repeat(phi_chunk, repeats=n_shells, axis=0)
+    
+                    x_target_np = np.hstack([theta_expanded, phi_expanded]).astype(np.float32)
+                    mu_parts: list[np.ndarray] = []
+                    std_parts: list[np.ndarray] = []
+    
+                    with torch.no_grad():
+                        for row_start in range(0, len(x_target_np), chunk_size):
+                            row_end = min(len(x_target_np), row_start + chunk_size)
+    
+                            target_x = torch.from_numpy(x_target_np[row_start:row_end]).to(dev)
+    
+                            mu_t, std_t = model.predict_proba_mc(
+                                context_x,
+                                context_y,
+                                target_x,
+                                mc_samples=mc_samples,
+                            )
+    
+                            mu_parts.append(mu_t.cpu().numpy())
+                            std_parts.append(std_t.cpu().numpy())
+                    mu = np.vstack(mu_parts).reshape(-1)
+                    std = np.vstack(std_parts).reshape(-1)
 
-            for event_start in range(0, len(event_df), events_per_chunk):
-                event_end = min(len(event_df), event_start+events_per_chunk)
+                    repeated_event_index = np.repeat(event_index_chunk, repeats=n_shells)
+                    tiled_shell_index = np.tile(shell_indices, reps=n_events_chunk)
+                    repeated_true_shell = np.repeat(true_shell_chunk, repeats=n_shells)
+                    
+                    out = pd.DataFrame({
+                            "iteration": float(iteration),
+                            "fidelity": float(fidelity),
+                            "source_file": file_path.name,
+                            "event_index": repeated_event_index,
+                            "shell_index": tiled_shell_index,
+                            "true_shell_index": repeated_true_shell,
+                            "y_cnp": mu,
+                            "y_cnp_err": std,
+                        })
+                    for theta_col_idx, theta_name in enumerate(runtime.theta_headers):
+                        out[theta_name] = theta_expanded[:, theta_col_idx]
 
-                phi_chunk = event_phi[event_start:event_end]
-                event_index_chunk = event_indices[event_start:event_end]
-                n_events_chunk = len(phi_chunk)
+                    # Save to csv
+                    out["y_raw"] = out["shell_index"].to_numpy(dtype=np.int32) == out["true_shell_index"].to_numpy(dtype=np.int32).astype(float)
+                    prob_sum = out.groupby("event_index")["y_cnp"].transform("sum")
+                    out["p_shell"] = np.where(prob_sum > 0, out["y_cnp"] / prob_sum, 0.0)
+                        
+                    best_idx = out.groupby("event_index")["p_shell"].idxmax()
+                    best_chunk = out.loc[best_idx].copy()
+    
+                    best_chunk = best_chunk.rename(
+                        columns = {
+                            "shell_index": "predicted_shell_index",
+                            "p_shell": "predicted_shell_probability",
+                            "y_cnp": "predicted_shell_score"
+                        })
+                
+                    out.to_csv(all_shell_csv, mode="w" if write_all_header else "a", header=write_all_header, index=False)
+                    write_all_header = False
+    
+                    best_chunk.to_csv(best_shell_csv, mode="w" if write_best_header else "a", header=write_best_header, index=False)
+                    write_best_header = False
 
-                theta_expanded = np.tile(shell_theta, (n_events_chunk, 1))
-                phi_expanded = np.repeat(phi_chunk, repeats=n_shells, axis=0)
-
-                x_target_np = np.hstack([theta_expanded, phi_expanded]).astype(np.float32)
-                mu_parts: list[np.ndarray] = []
-                std_parts: list[np.ndarray] = []
-
-                with torch.no_grad():
-                    for row_start in range(0, len(x_target_np), chunk_size):
-                        row_end = min(len(x_target_np), row_start + chunk_size)
-
-                        target_x = torch.from_numpy(x_target_np[row_start:row_end]).to(dev)
-
-                        mu_t, std_t = model.predict_proba_mc(
-                            context_x,
-                            context_y,
-                            target_x,
-                            mc_samples=mc_samples,
+                    agg_source = out[out["true_shell_index"] >= 0].copy()
+                    if not agg_source.empty:
+                        agg_chunk = (
+                            agg_source.groupby(
+                                ["iteration", "fidelity", *runtime.theta_headers],
+                                as_index=False,
+                            )
+                            .agg(
+                                y_cnp_sum=("y_cnp", "sum"),
+                                y_cnp_err_sq_sum=(
+                                    "y_cnp_err",
+                                    lambda x: float(np.sum(np.square(x))),
+                                ),
+                                y_raw_sum=("y_raw", "sum"),
+                                n_samples=("y_cnp", "size"),
+                            )
                         )
 
-                        mu_parts.append(mu_t.cpu().numpy())
-                        std_parts.append(std_t.cpu().numpy())
-                mu = np.vstack(mu_parts).reshape(-1)
-                std = np.vstack(std_parts).reshape(-1)
+                        agg_chunks.append(agg_chunk)
+                    
+                    total_event_count += n_events_chunk
+                    total_pair_count += len(out)
+                    
+                    # Cleanup for data management
+                    del theta_expanded, phi_expanded, x_target_np
+                    del out, best_chunk
+                    del mu_parts, std_parts, mu, std
 
-                out = pd.DataFrame({
-                        "iteration": float(iteration),
-                        "fidelity": float(fidelity),
-                        "source_file": file_path.name,
-                        "event_index": np.repeat(event_index_chunk, repeats=n_shells),
-                        "shell_index": np.tile(shell_indices, reps=n_events_chunk),
-                        "y_cnp": mu,
-                        "y_cnp_err": std,
-                    })
-                for theta_col_idx, theta_name in enumerate(runtime.theta_headers):
-                    out[theta_name] = theta_expanded[:, theta_col_idx]
-
-                file_parts.append(out)
+                    if "agg_source" in locals():
+                        del agg_source
+                    if "agg_chunk" in locals():
+                        del agg_chunk
                 
-            if file_parts:
-                rows.append(pd.concat(file_parts, ignore_index=True))
+                del context_x, context_y, x_np, y_np
+                
+                # Update progress bar
+                pbar.update(1)
+                pbar.set_postfix(
+                    events=f"{total_event_count:,}",
+                    pairs=f"{total_pair_count:,}"
+                )
 
-    if rows:
-        df = pd.concat(rows, ignore_index=True)
+    required_cols = [
+        "iteration",
+        "fidelity",
+        "n_samples",
+        *runtime.theta_headers,
+        "y_cnp",
+        "y_cnp_err",
+        "y_raw",
+        "log_prop",
+        "bce",
+        "source_file",
+    ]
 
-        prob_sum = df.groupby("event_index")["y_cnp"].transform("sum")
-        df["p_shell"] = np.where(
-            prob_sum > 0,
-            df["y_cnp"] / prob_sum,
+    if agg_chunks:
+        agg_all = pd.concat(agg_chunks, ignore_index=True)
+
+        agg_final = (
+            agg_all.groupby(
+                ["iteration", "fidelity", *runtime.theta_headers],
+                as_index=False,
+            )
+            .agg(
+                y_cnp_sum=("y_cnp_sum", "sum"),
+                y_cnp_err_sq_sum=("y_cnp_err_sq_sum", "sum"),
+                y_raw_sum=("y_raw_sum", "sum"),
+                n_samples=("n_samples", "sum"),
+            )
+        )
+
+        agg_final["y_cnp"] = agg_final["y_cnp_sum"] / agg_final["n_samples"]
+
+        agg_final["y_cnp_err"] = np.sqrt(
+            agg_final["y_cnp_err_sq_sum"] / agg_final["n_samples"]
+        )
+
+        agg_final["y_raw"] = agg_final["y_raw_sum"] / agg_final["n_samples"]
+
+        eps = 1e-6
+        p = np.clip(
+            agg_final["y_cnp"].to_numpy(dtype=float),
+            eps,
+            1.0 - eps,
+        )
+        y = np.clip(
+            agg_final["y_raw"].to_numpy(dtype=float),
             0.0,
+            1.0,
         )
 
-        best_idx = df.groupby("event_index")["p_shell"].idxmax()
+        agg_final["log_prop"] = y * np.log(p) + (1.0 - y) * np.log(1.0 - p)
+        agg_final["bce"] = -agg_final["log_prop"]
+        agg_final["source_file"] = "aggregated_event_shell_predictions"
 
-        best_df = df.loc[best_idx].copy()
-        best_df = best_df.rename(
-            columns={
-                "shell_index": "predicted_shell_index",
-                "p_shell": "predicted_shell_probability",
-                "y_cnp": "predicted_shell_score",
-            }
-        )
+        agg_final = agg_final[required_cols]
+        agg_final.to_csv(mfgp_csv, index=False)
+
     else:
-        df = pd.DataFrame()
-        best_df = pd.DataFrame()
+        pd.DataFrame(columns=required_cols).to_csv(mfgp_csv, index=False)
 
-    all_shell_csv = (
-        runtime.out_dir
-        / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs_all_shells.csv"
-    )
-    best_shell_csv = (
-        runtime.out_dir
-        / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs_best_shell.csv"
-    )
-    df.to_csv(all_shell_csv, index=False)
-    best_df.to_csv(best_shell_csv, index=False)
-
+    print(f"Saved MFGP compatable CNP CSV: {mfgp_csv}")
     print(f"Saved all event-shell probabilities: {all_shell_csv}")
     print(f"Saved best shell per event: {best_shell_csv}")
 
     return PredictResult(
-        csv_path=all_shell_csv,
-        heatmap_path=best_shell_csv,
-        error_heatmap_path=best_shell_csv,
+        all_path=all_shell_csv,
+        best_path=best_shell_csv,
+        mfgp_path=mfgp_csv
     )
     
 # -----------------------------

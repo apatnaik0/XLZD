@@ -51,6 +51,7 @@ simulation_settings:
   - 1000.0
   lf_cost: 1
   hf_cost: 10
+  negative_shells: 4
 path_settings:
   version: xlzd_equal_volume_shell_v1_minibatch
   path_to_files_train: ../outputs_equal_volume_shell_theta/training/lf

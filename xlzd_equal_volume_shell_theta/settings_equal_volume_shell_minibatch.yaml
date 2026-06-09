@@ -25,6 +25,7 @@ simulation_settings:
   Z_max: 2000.0
   n_shells: 100
   scale_power: 0.3333333333333333
+  negative_shells: 4
   theta_headers:
   - R_shell
   - Z_shell
