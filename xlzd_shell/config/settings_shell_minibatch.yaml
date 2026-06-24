@@ -21,11 +21,10 @@ cnp_settings:
   plot_after: 5000
 simulation_settings:
   simulation_type: shell
-  R_max: 1500.0
-  Z_max: 2000.0
+  R_max: 1490.0
+  Z_max: 1983.0
   n_shells: 100
   scale_power: 0.3333333333333333
-  negative_shells: 4
   theta_headers:
   - R_shell
   - Z_shell
@@ -33,25 +32,14 @@ simulation_settings:
   - s_r
   - s_z_from_center
   target_headers:
-  - inside_shell
-  target_range:
-  - 0
-  - 1
+  - target_shell
   signal_condition:
   - inside_shell==1
   weights_labels:
   - weights
-  theta_min:
-  - 0.0
-  - 0.0
-  theta_max:
-  - 1500.0
-  - 2000.0
-  theta_fixed:
-  - 750.0
-  - 1000.0
   lf_cost: 1
   hf_cost: 10
+  negative_shells: 4
 path_settings:
   version: xlzd_shell_v1_minibatch
   path_to_files_train: ../../shell_outputs/training/lf

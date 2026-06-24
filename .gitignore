@@ -5,23 +5,26 @@ data/**
 !data/**/.gitkeep
 
 # Generated outputs
-outputs/**
-!outputs/.gitkeep
-!outputs/**/
-!outputs/**/.gitkeep
+archive/outputs/**
+!archive/outputs/.gitkeep
+!archive/outputs/**/
+!archive/outputs/**/.gitkeep
 
-outputs_smoke/**
-!outputs_smoke/.gitkeep
-!outputs_smoke/**/
-!outputs_smoke/**/.gitkeep
+archive/outputs_smoke/**
+!archive/outputs_smoke/.gitkeep
+!archive/outputs_smoke/**/
+!archive/outputs_smoke/**/.gitkeep
 
-outputs_equal_volume_shell_theta/
+shell_outputs/**
+!shell_outputs/.gitkeep
+!shell_outputs/**/
+!shell_outputs/**/.gitkeep
 
 # Depth penetration HTML artifacts
-depth_penetration_experiments/artifacts/**
-!depth_penetration_experiments/artifacts/.gitkeep
-lf_augmentations/artifacts/**
-!lf_augmentations/artifacts/.gitkeep
+archive/depth_penetration_experiments/artifacts/**
+!archive/depth_penetration_experiments/artifacts/.gitkeep
+archive/lf_augmentations/artifacts/**
+!archive/lf_augmentations/artifacts/.gitkeep
 
 # Python cache / build artifacts
 __pycache__/
@@ -40,6 +43,3 @@ env/
 .DS_Store
 .idea/
 .vscode/
-
-# Jupyter Notebook Checkpoints
-.ipynb_checkpoints/

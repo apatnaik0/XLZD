@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,13 +46,9 @@ class CNPRuntimeConfig:
     Z_max: float
     n_shells: int
     scale_power: float
-    negative_shells: float
     theta_headers: List[str]
-    theta_min: List[float]
-    theta_max: List[float]
     phi_headers: List[str]
     target_headers: List[str]
-    target_range: List[float]
     context_ratio: float
     context_mode: str
     training_mode: str
@@ -61,12 +56,8 @@ class CNPRuntimeConfig:
     steps_per_epoch: int
     batch_size_train: int
     files_per_batch_train: int
-    batch_size_predict: List[int]
-    files_per_batch_predict: int
     ratio_testing_vs_training: float
     plot_after: int
-    use_data_augmentation: str | bool
-    use_beta: List[float]
     seed: int
 
 
@@ -87,9 +78,11 @@ def _as_float_fraction(value: object, default: float) -> float:
 def _resolve_path(path_value: str | Path, base: Path) -> Path:
     p = Path(path_value)
     return p if p.is_absolute() else (base / p).resolve()
-
-
-def load_runtime_config(config_path: str | Path, seed: int = 42) -> CNPRuntimeConfig:
+    
+def load_runtime_config(
+    config_path: str | Path,
+    seed: int = 42
+) -> CNPRuntimeConfig:
     config_path = Path(config_path).resolve()
     raw = yaml.safe_load(config_path.read_text())
 
@@ -106,7 +99,7 @@ def load_runtime_config(config_path: str | Path, seed: int = 42) -> CNPRuntimeCo
         predict_iterations.extend([0] * (len(predict_dirs) - len(predict_iterations)))
     if len(predict_fidelities) < len(predict_dirs):
         predict_fidelities.extend([0] * (len(predict_dirs) - len(predict_fidelities)))
-
+    
     return CNPRuntimeConfig(
         config_path=config_path,
         version=str(paths.get("version", "v_clean")),
@@ -119,13 +112,9 @@ def load_runtime_config(config_path: str | Path, seed: int = 42) -> CNPRuntimeCo
         Z_max=float(sim.get("Z_max", 2000.0)),
         n_shells=int(sim.get("n_shells", 100)),
         scale_power=float(sim.get("scale_power", 1.0/3.0)),
-        negative_shells=int(sim.get("negative_shells", 4)),
-        theta_headers=list(sim.get("theta_headers", ["R_max", "Z_max"])),
-        theta_min=[float(x) for x in sim.get("theta_min", [0.0, 0.0])],
-        theta_max=[float(x) for x in sim.get("theta_max", [1.0, 1.0])],
+        theta_headers=list(sim.get("theta_headers", ["R_shell", "Z_shell"])),
         phi_headers=list(sim.get("phi_labels", ["s_r", "s_z_from_center"])),
-        target_headers=list(sim.get("target_headers", ["inside_theta"])),
-        target_range=[float(x) for x in sim.get("target_range", [0, 1])],
+        target_headers=list(sim.get("target_headers", ["target_shell"])),
         context_ratio=float(cnp.get("context_ratio", 1 / 3)),
         context_mode=str(cnp.get("context_mode", "random")).strip().lower(),
         training_mode=str(cnp.get("training_mode", "minibatch")).strip().lower(),
@@ -133,12 +122,8 @@ def load_runtime_config(config_path: str | Path, seed: int = 42) -> CNPRuntimeCo
         steps_per_epoch=int(cnp.get("steps_per_epoch", 5000)),
         batch_size_train=int(cnp.get("batch_size_train", 4096)),
         files_per_batch_train=int(cnp.get("files_per_batch_train", 32)),
-        batch_size_predict=[int(x) for x in cnp.get("batch_size_predict", [30000, 100000])],
-        files_per_batch_predict=int(cnp.get("files_per_batch_predict", 1)),
         ratio_testing_vs_training=_as_float_fraction(cnp.get("ratio_testing_vs_training", "1/40"), default=1 / 40),
         plot_after=int(cnp.get("plot_after", 1000)),
-        use_data_augmentation=cnp.get("use_data_augmentation", False),
-        use_beta=list(cnp.get("use_beta", [])) if cnp.get("use_beta") is not None else [],
         seed=seed,
     )
 
@@ -158,90 +143,97 @@ def set_seed(seed: int) -> None:
 
 @dataclass
 class EventBatch:
-    x: torch.Tensor
-    y: torch.Tensor
+    x: torch.Tensor # Phi, float 32, shape(N, phi_dim)
+    y: torch.Tensor # target_shell, int64, shape(N,)
 
 
 class H5EventPool:
-    """Event sampler across multiple H5 files.
+    """Event-level sampler for categorical shell classification.
 
-    Each H5 File contains:
-        theta:  (N, theta_dim) -> Current Theta: (R_shell, Z_shell) -> theta_dim = 2
-        phi:    (N, phi_dim) -> Current Phi: (s_r, s_z_from_center) -> phi_dim = 2
-        target: (N, target_dim) -> Current targets: (0 or 1) -> target_dim = 1
+    Each H5 file contains:
+        phi:          (N, phi_dim)
+        target_shell: (N,) int64, zero-based shell class labels 0..n_shells-1
 
-    The model I/O is: 
-        x = [theta, phi]
-        y = target
+    The model I/O is:
+        x = phi
+        y = target_shell
     """
+
     def __init__(
         self,
         directory: str | Path,
-        theta_headers: Sequence[str],
         phi_headers: Sequence[str],
         target_headers: Sequence[str],
+        n_shells: int,
         seed: int = 42,
         cache_files: bool = True,
     ) -> None:
         self.directory = Path(directory)
-        self.theta_headers = list(theta_headers)
         self.phi_headers = list(phi_headers)
         self.target_headers = list(target_headers)
+        self.n_shells = int(n_shells)
         self.rng = np.random.default_rng(seed)
         self.cache_files = cache_files
-        self._cache: Dict[Path, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+        self._cache: Dict[Path, Tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]] = {}
         self._row_count_cache: Dict[Path, int] = {}
 
         if not self.directory.exists():
             raise FileNotFoundError(f"H5 directory does not exist: {self.directory}")
+
         self.files = sorted([p for p in self.directory.glob("*.h5") if p.is_file()])
         if not self.files:
             raise FileNotFoundError(f"No .h5 files found in {self.directory}")
 
     def _decode_labels(self, arr: np.ndarray) -> List[str]:
-        labels: List[str] = []
-        for item in arr:
-            labels.append(item.decode("utf-8") if isinstance(item, (bytes, np.bytes_)) else str(item))
-        return labels
-    
-    def _load_one(self, file_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return [
+            item.decode("utf-8") if isinstance(item, (bytes, np.bytes_)) else str(item)
+            for item in arr
+        ]
+
+    def _read_meta(self, f: h5py.File) -> dict[str, np.ndarray]:
+        meta: dict[str, np.ndarray] = {}
+        if "meta" not in f:
+            return meta
+
+        for key in f["meta"].keys():
+            meta[key] = np.asarray(f["meta"][key])
+
+        return meta
+
+    def _load_one(self, file_path: Path) -> Tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
         if self.cache_files and file_path in self._cache:
             return self._cache[file_path]
 
         with h5py.File(file_path, "r") as f:
-            # Load theta, phi, target
-            theta = np.asarray(f["theta"], dtype=np.float32)
-            phi = np.asarray(f["phi"], dtype=np.float32)
-            target = np.asarray(f["target"], dtype=np.float32)
+            if "phi" not in f:
+                raise ValueError(f"{file_path.name}: missing dataset 'phi'")
 
-            # Checks
-            # If target = (N,) -> (N, 1)
-            if target.ndim == 1: 
-                target = target.reshape(-1, 1)
-            # Checks theta = (N, theta_dim)
-            if theta.ndim != 2:
-                raise ValueError(f"{file_path.name}: expected theta shape (N, theta_dim) got {theta.shape}")
-            # Checks phi = (N, phi_dim)
+            if "target_shell" not in f:
+                raise ValueError(f"{file_path.name}: missing dataset 'target_shell'")
+
+            phi = np.asarray(f["phi"], dtype=np.float32)
+            target_shell = np.asarray(f["target_shell"], dtype=np.int64).reshape(-1)
+            meta = self._read_meta(f)
+
             if phi.ndim != 2:
                 raise ValueError(f"{file_path.name}: expected phi shape (N, phi_dim), got {phi.shape}")
-            # Checks target = (N, target_dim)
-            if target.ndim != 2:
-                raise ValueError(f"{file_path.name}: expected target shape (N, target_dim), got {target.shape}")
-            # Checks all are the same length (since each event has a theta, phi, target they should all be the same)
-            if len(theta) != len(phi) or len(theta) != len(target):
+
+            if len(phi) != len(target_shell):
                 raise ValueError(
                     f"{file_path.name}: row count mismatch: "
-                    f"theta={len(theta)}, phi={len(phi)}, target={len(target)}"
+                    f"phi={len(phi)}, target_shell={len(target_shell)}"
                 )
-                
-            # Optional label validation when available.
-            if "theta_headers" in f:
-                labels = self._decode_labels(np.asarray(f["theta_headers"]))
-                if labels[: len(self.theta_headers)] != self.theta_headers:
+
+            if len(target_shell) > 0:
+                y_min = int(target_shell.min())
+                y_max = int(target_shell.max())
+                if y_min < 0 or y_max >= self.n_shells:
                     raise ValueError(
-                        f"Theta headers mismatch in {file_path.name}. "
-                        f"Expected {self.theta_headers}, got {labels}"
+                        f"{file_path.name}: target_shell must be in [0, {self.n_shells - 1}], "
+                        f"got min={y_min}, max={y_max}"
                     )
+
             if "phi_labels" in f:
                 labels = self._decode_labels(np.asarray(f["phi_labels"]))
                 if labels[: len(self.phi_headers)] != self.phi_headers:
@@ -249,6 +241,7 @@ class H5EventPool:
                         f"Phi labels mismatch in {file_path.name}. "
                         f"Expected {self.phi_headers}, got {labels}"
                     )
+
             if "target_headers" in f:
                 labels = self._decode_labels(np.asarray(f["target_headers"]))
                 if labels[: len(self.target_headers)] != self.target_headers:
@@ -258,15 +251,16 @@ class H5EventPool:
                     )
 
         if self.cache_files:
-            self._cache[file_path] = (theta, phi, target)
-        return theta, phi, target
+            self._cache[file_path] = (phi, target_shell, meta)
+
+        return phi, target_shell, meta
 
     def _count_rows_one(self, file_path: Path) -> int:
         if file_path in self._row_count_cache:
             return self._row_count_cache[file_path]
 
         with h5py.File(file_path, "r") as f:
-            n_rows = int(f["target"].shape[0])
+            n_rows = int(f["target_shell"].shape[0])
 
         self._row_count_cache[file_path] = n_rows
         return n_rows
@@ -276,9 +270,10 @@ class H5EventPool:
 
         if k == len(self.files):
             return self.files
+
         idx = self.rng.choice(len(self.files), size=k, replace=False)
         return [self.files[i] for i in idx]
-        
+
     def sample_batch(self, batch_size: int, files_per_batch: int) -> EventBatch:
         chosen = self._choose_files(files_per_batch)
         per_file = max(1, batch_size // len(chosen))
@@ -287,24 +282,27 @@ class H5EventPool:
         ys: List[np.ndarray] = []
 
         for f in chosen:
-            theta, phi, target = self._load_one(f)
-            n = len(target)
+            phi, target_shell, _meta = self._load_one(f)
+            n = len(target_shell)
+
             if n == 0:
-                continue        
+                continue
+
             idx = self.rng.integers(0, n, size=per_file)
 
-            x = np.hstack([theta[idx], phi[idx]]).astype(np.float32)
-            y = target[idx].astype(np.float32)
-            
-            xs.append(x)
-            ys.append(y)
+            xs.append(phi[idx].astype(np.float32))
+            ys.append(target_shell[idx].astype(np.int64))
 
         if not xs:
             raise RuntimeError("Could not sample non-empty batch from H5 files")
 
         x_arr = np.vstack(xs).astype(np.float32)
-        y_arr = np.vstack(ys).astype(np.float32)
-        return EventBatch(x=torch.from_numpy(x_arr), y=torch.from_numpy(y_arr))
+        y_arr = np.concatenate(ys).astype(np.int64)
+
+        return EventBatch(
+            x=torch.from_numpy(x_arr),
+            y=torch.from_numpy(y_arr),
+        )
 
     def iter_epoch_batches(
         self,
@@ -314,13 +312,14 @@ class H5EventPool:
         shuffle: bool = True,
         drop_last: bool = False,
     ) -> Iterable[EventBatch]:
-        """Yield batches so every event row is seen once per epoch."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
+
         if files_per_batch <= 0:
             raise ValueError("files_per_batch must be positive.")
 
         file_order = list(self.files)
+
         if shuffle and len(file_order) > 1:
             perm = self.rng.permutation(len(file_order))
             file_order = [file_order[i] for i in perm]
@@ -331,11 +330,12 @@ class H5EventPool:
 
         def flush_batches(final: bool = False) -> Iterable[EventBatch]:
             nonlocal x_buffer, y_buffer, buffer_rows
+
             if buffer_rows == 0:
                 return
 
             x_arr = np.vstack(x_buffer).astype(np.float32)
-            y_arr = np.vstack(y_buffer).astype(np.float32)
+            y_arr = np.concatenate(y_buffer).astype(np.int64)
 
             if shuffle and len(x_arr) > 1:
                 perm = self.rng.permutation(len(x_arr))
@@ -343,9 +343,11 @@ class H5EventPool:
                 y_arr = y_arr[perm]
 
             n_full = len(x_arr) // batch_size
+
             for batch_idx in range(n_full):
                 start = batch_idx * batch_size
                 end = start + batch_size
+
                 yield EventBatch(
                     x=torch.from_numpy(x_arr[start:end]),
                     y=torch.from_numpy(y_arr[start:end]),
@@ -356,9 +358,12 @@ class H5EventPool:
             remainder_y = y_arr[used:]
 
             if final and len(remainder_x) and not drop_last:
-                yield EventBatch(x=torch.from_numpy(remainder_x), y=torch.from_numpy(remainder_y))
+                yield EventBatch(
+                    x=torch.from_numpy(remainder_x),
+                    y=torch.from_numpy(remainder_y),
+                )
                 remainder_x = np.empty((0, x_arr.shape[1]), dtype=np.float32)
-                remainder_y = np.empty((0, y_arr.shape[1]), dtype=np.float32)
+                remainder_y = np.empty((0,), dtype=np.int64)
 
             x_buffer = [remainder_x] if len(remainder_x) else []
             y_buffer = [remainder_y] if len(remainder_y) else []
@@ -366,17 +371,22 @@ class H5EventPool:
 
         for start in range(0, len(file_order), files_per_batch):
             file_group = file_order[start : start + files_per_batch]
+
             for f in file_group:
-                theta, phi, target = self._load_one(f)
-                n = len(target)
+                phi, target_shell, _meta = self._load_one(f)
+                n = len(target_shell)
+
                 if n == 0:
                     continue
-                x = np.hstack([theta, phi]).astype(np.float32)
-                y = target.astype(np.float32)
+
+                x = phi.astype(np.float32)
+                y = target_shell.astype(np.int64)
+
                 if shuffle and n > 1:
                     perm = self.rng.permutation(n)
                     x = x[perm]
                     y = y[perm]
+
                 x_buffer.append(x)
                 y_buffer.append(y)
                 buffer_rows += n
@@ -391,12 +401,10 @@ class H5EventPool:
             total += self._count_rows_one(f)
         return total
 
-    def iter_file_data(self) -> Iterable[Tuple[Path, np.ndarray, np.ndarray, np.ndarray]]:
+    def iter_file_data(self) -> Iterable[Tuple[Path, np.ndarray, np.ndarray, dict[str, np.ndarray]]]:
         for f in self.files:
-            theta, phi, target = self._load_one(f)
-            x = np.hstack([theta, phi]).astype(np.float32)
-            y = target.astype(np.float32)
-            yield f, x, y, theta.astype(np.float32)
+            phi, target_shell, meta = self._load_one(f)
+            yield f, phi.astype(np.float32), target_shell.astype(np.int64), meta
 
 # -----------------------------
 # CNP model
@@ -469,24 +477,23 @@ class DeterministicCNP(nn.Module):
         mc_samples: int = 30,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         was_training = self.training
-        self.train()  # Enable dropout for MC uncertainty.
-
+        self.train()  # enable dropout for MC uncertainty
+    
         preds = []
-        sigmas = []
+    
         for _ in range(mc_samples):
-            logits, sigma = self.forward(context_x, context_y, target_x)
-            preds.append(torch.sigmoid(logits))
-            sigmas.append(sigma)
-        pred = torch.stack(preds, dim=0)
-        sigma_stack = torch.stack(sigmas, dim=0)
-        mean = pred.mean(dim=0)
-        # Blend epistemic (MC variance of probabilities) + aleatoric (model sigma head).
-        epistemic = pred.std(dim=0, unbiased=False)
-        aleatoric = sigma_stack.mean(dim=0)
-        std = torch.sqrt(epistemic.pow(2) + aleatoric.pow(2))
-
+            logits, _sigma = self.forward(context_x, context_y, target_x)
+            probs = F.softmax(logits, dim=-1)
+            preds.append(probs)
+    
+        pred_stack = torch.stack(preds, dim=0)
+    
+        mean = pred_stack.mean(dim=0)
+        std = pred_stack.std(dim=0, unbiased=False)
+    
         if not was_training:
             self.eval()
+    
         return mean, std
 
 
@@ -508,17 +515,30 @@ class PredictResult:
     best_path: Path
     mfgp_path: Path
 
-def split_context_target(
+def split_context_target_class(
     x: torch.Tensor,
     y: torch.Tensor,
+    n_classes: int,
     context_ratio: float,
     rng: np.random.Generator,
     context_mode: str = "random",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    x: float tensor, shape (N, phi_dim)
+    y: long tensor, shape (N,), class labels 0..n_classes-1
+
+    Returns:
+        context_x:       (N_context, phi_dim)
+        context_y:       (N_context, n_classes)
+        target_x:        (N, phi_dim)
+        target_y:        (N,)
+    """
     n = x.shape[0]
     if n < 4:
         raise ValueError("Batch too small; need at least 4 samples for context-target split")
 
+    y=y.long()
+    
     min_context = max(2, int(0.1 * n))
     max_context = max(min_context + 1, int(context_ratio * n))
     max_context = min(max_context, n - 1)
@@ -531,106 +551,291 @@ def split_context_target(
         raise ValueError(f"Unsupported context_mode={context_mode!r}. Expected 'random' or 'fixed'.")
 
     perm = rng.permutation(n)
-    context_idx = perm[:num_context]
+    context_idx = torch.as_tensor(perm[:num_context], dtype=torch.long, device=x.device)
 
     context_x = x[context_idx]
-    context_y = y[context_idx]
+    context_y_idx = y[context_idx]
+    context_y = F.one_hot(context_y_idx, num_classes=n_classes).float()
 
     target_x = x
     target_y = y
     return context_x, context_y, target_x, target_y
 
 
-def _plot_training_history(df: pd.DataFrame, out_path: Path) -> None:
-    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-    ax.plot(df["step"], df["train_bce"], label="train BCE")
-    ax.plot(df["step"], df["val_bce"], label="val BCE")
-    ax.set_xlabel("step")
-    ax.set_ylabel("BCE")
-    ax.set_title("CNP training history")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
+def compute_shell_class_weights(
+    pool: H5EventPool,
+    n_shells: int,
+    beta: float | None = 0.999,
+    max_weight: float | None = 20.0,
+) -> torch.Tensor:
+    counts = np.zeros(n_shells, dtype=np.float64)
+
+    for file_path in pool.files:
+        with h5py.File(file_path, "r") as f:
+            target_shell = np.asarray(f["target_shell"], dtype=np.int64).reshape(-1)
+        counts += np.bincount(target_shell, minlength=n_shells)
+
+    if np.any(counts == 0):
+        missing = np.where(counts == 0)[0]
+        print(f"[warn] Shell classes with zero training examples: {missing.tolist()}")
+
+    safe_counts = np.maximum(counts, 1.0)
+
+    if beta is None:
+        weights = safe_counts.sum() / (n_shells * safe_counts)
+    else:
+        effective_num = 1.0 - np.power(beta, safe_counts)
+        weights = (1.0 - beta) / effective_num
+
+    present = counts > 0
+
+    if np.any(present):
+        weights[present] = weights[present] / weights[present].mean()
+
+    weights[~present] = 0.0
+
+    if max_weight is not None:
+        weights = np.clip(weights, 0.0, max_weight)
+
+    print("\n[class weights]")
+    print(f"min count: {counts[present].min() if np.any(present) else 0:.0f}")
+    print(f"max count: {counts[present].max() if np.any(present) else 0:.0f}")
+    print(f"min weight: {weights[present].min() if np.any(present) else 0:.4f}")
+    print(f"max weight: {weights[present].max() if np.any(present) else 0:.4f}")
+
+    return torch.tensor(weights, dtype=torch.float32)
 
 
-def _plot_sample_predictions(pred: np.ndarray, truth: np.ndarray, out_path: Path) -> None:
-    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-    order = np.argsort(pred)
-    ax.plot(pred[order], label="predicted inside-theta probability", lw=1.5)
-    ax.plot(truth[order], label="true inside-theta label", lw=1.0)
-    ax.set_xlabel("sample index (sorted by prediction)")
-    ax.set_ylabel("inside-theta value")
-    ax.set_title("Sample Batch: Inside-Theta Prediction vs Truth")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
+def _class_probability_diagnostics(
+    logits: torch.Tensor,
+    true_shell: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Convert categorical logits into useful diagnostic quantities.
+
+    Returns:
+        p_true:       probability assigned to the true shell
+        p_best_wrong: highest probability assigned to any wrong shell
+        pred_shell:   predicted zero-based shell index
+        true_rank:    rank of the true shell, where 1 means the true shell was top prediction
+    """
+    probs = F.softmax(logits.detach(), dim=-1).cpu().numpy()
+    true_shell_np = true_shell.detach().cpu().numpy().astype(np.int64)
+
+    rows = np.arange(len(true_shell_np))
+
+    p_true = probs[rows, true_shell_np]
+
+    wrong_probs = probs.copy()
+    wrong_probs[rows, true_shell_np] = -np.inf
+    p_best_wrong = np.max(wrong_probs, axis=1)
+
+    pred_shell = np.argmax(probs, axis=1)
+
+    # Rank 1 means true shell has the highest predicted probability.
+    # Rank 2 means one shell had higher probability than the true shell, etc.
+    true_rank = 1 + np.sum(probs > p_true[:, None], axis=1)
+
+    return p_true, p_best_wrong, pred_shell, true_rank
 
 
-def _split_inside_outside(y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 0.5) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    y_true = np.asarray(y_true).reshape(-1)
-    y_pred = np.asarray(y_pred).reshape(-1)
-    inside_idx = np.where(y_true > threshold)[0]
-    outside_idx = np.where(y_true <= threshold)[0]
-    return y_true[inside_idx], y_pred[inside_idx], y_true[outside_idx], y_pred[outside_idx]
-
-
-def _plot_train_val_snapshot(
-    train_pred: np.ndarray,
-    train_truth: np.ndarray,
-    val_pred: np.ndarray,
-    val_truth: np.ndarray,
+def _plot_train_val_shell_probability_snapshot(
+    train_logits: torch.Tensor,
+    train_true_shell: torch.Tensor,
+    val_logits: torch.Tensor,
+    val_true_shell: torch.Tensor,
     out_path: Path,
     step: int,
     train_loss: float,
     val_loss: float,
-    target_range: Sequence[float] = (0.0, 1.0),
+    n_shells: int,
+    max_wrong_samples: int = 200_000,
 ) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    fig.suptitle(f"Training Iteration {step}", fontsize=10)
+    """
+    Categorical replacement for the old BCE inside/outside monitor plot.
 
-    tr_in_true, tr_in_pred, tr_out_true, tr_out_pred = _split_inside_outside(train_truth, train_pred)
-    va_in_true, va_in_pred, va_out_true, va_out_pred = _split_inside_outside(val_truth, val_pred)
+    For each event:
+        true shell probability      = softmax probability at the true class
+        wrong shell probabilities   = softmax probabilities at all non-true classes
 
-    bins = 100
-    label_out = (3 / 255, 37 / 255, 46 / 255)
-    pred_out = (113 / 255, 150 / 255, 159 / 255)
-    label_in = "orangered"
-    pred_in = "coral"
+    This mirrors the old plot:
+        true label = 1
+        wrong labels = 0
+    """
+    train_probs = F.softmax(train_logits.detach(), dim=-1).cpu().numpy()
+    val_probs = F.softmax(val_logits.detach(), dim=-1).cpu().numpy()
 
-    if len(tr_in_true) > 0:
-        axes[0].hist(tr_in_true, range=target_range, bins=bins, color=label_in, alpha=1.0, label="true label (inside theta)")
-    axes[0].hist(tr_out_true, range=target_range, bins=bins, color=label_out, alpha=0.8, label="true label (outside theta)")
-    axes[0].hist(tr_out_pred, range=target_range, bins=bins, color=pred_out, alpha=0.8, label="network score (outside theta)")
-    if len(tr_in_pred) > 0:
-        axes[0].hist(tr_in_pred, range=target_range, bins=bins, color=pred_in, alpha=0.8, label="network score (inside theta)")
+    train_true = train_true_shell.detach().cpu().numpy().astype(np.int64)
+    val_true = val_true_shell.detach().cpu().numpy().astype(np.int64)
+
+    rng = np.random.default_rng(12345)
+
+    def split_true_wrong(
+        probs: np.ndarray,
+        true_shell: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        n_events, n_classes = probs.shape
+        rows = np.arange(n_events)
+
+        true_scores = probs[rows, true_shell]
+
+        wrong_mask = np.ones_like(probs, dtype=bool)
+        wrong_mask[rows, true_shell] = False
+        wrong_scores = probs[wrong_mask]
+
+        # There are 99 wrong probabilities per event, so optionally downsample
+        # them to keep the plot readable and fast.
+        if len(wrong_scores) > max_wrong_samples:
+            idx = rng.choice(len(wrong_scores), size=max_wrong_samples, replace=False)
+            wrong_scores = wrong_scores[idx]
+
+        return true_scores, wrong_scores
+
+    train_true_scores, train_wrong_scores = split_true_wrong(train_probs, train_true)
+    val_true_scores, val_wrong_scores = split_true_wrong(val_probs, val_true)
+
+    train_pred = np.argmax(train_probs, axis=1)
+    val_pred = np.argmax(val_probs, axis=1)
+
+    train_acc = np.mean(train_pred == train_true)
+    val_acc = np.mean(val_pred == val_true)
+
+    train_mae = np.mean(np.abs(train_pred - train_true))
+    val_mae = np.mean(np.abs(val_pred - val_true))
+
+    random_prob = 1.0 / float(n_shells)
+
+    bins = np.linspace(0.0, 1.0, 101)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    fig.suptitle(f"Training Iteration {step}")
+
+    # Training panel
+    axes[0].hist(
+        np.zeros_like(train_wrong_scores),
+        bins=bins,
+        alpha=0.9,
+        label="true label (wrong shell)",
+    )
+    axes[0].hist(
+        np.ones_like(train_true_scores),
+        bins=bins,
+        alpha=0.9,
+        label="true label (true shell)",
+    )
+    axes[0].hist(
+        train_wrong_scores,
+        bins=bins,
+        alpha=0.75,
+        label="network score (wrong shell)",
+    )
+    axes[0].hist(
+        train_true_scores,
+        bins=bins,
+        alpha=0.75,
+        label="network score (true shell)",
+    )
+    axes[0].axvline(
+        random_prob,
+        linestyle="--",
+        linewidth=1.0,
+        label=f"random = {random_prob:.3f}",
+    )
     axes[0].set_yscale("log")
+    axes[0].set_xlabel(r"$P(\mathrm{shell})$")
     axes[0].set_ylabel("Count")
-    axes[0].set_xlabel(r"$y_{CNP}$")
-    axes[0].set_title(f"Training: Inside-Theta Monitor (loss {train_loss:.4f})", fontsize=10)
+    axes[0].set_title(
+        f"Training: Shell Probability Monitor "
+        f"(CE {train_loss:.4f}, acc {train_acc:.3f}, MAE {train_mae:.2f})",
+        fontsize=9,
+    )
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(fontsize=8)
 
-    if len(va_in_true) > 0:
-        axes[1].hist(va_in_true, range=target_range, bins=bins, color=label_in, alpha=1.0, label="true label (inside theta)")
-    axes[1].hist(va_out_true, range=target_range, bins=bins, color=label_out, alpha=0.8, label="true label (outside theta)")
-    axes[1].hist(va_out_pred, range=target_range, bins=bins, color=pred_out, alpha=0.8, label="network score (outside theta)")
-    if len(va_in_pred) > 0:
-        axes[1].hist(va_in_pred, range=target_range, bins=bins, color=pred_in, alpha=0.8, label="network score (inside theta)")
+    # Validation panel
+    axes[1].hist(
+        np.zeros_like(val_wrong_scores),
+        bins=bins,
+        alpha=0.9,
+        label="true label (wrong shell)",
+    )
+    axes[1].hist(
+        np.ones_like(val_true_scores),
+        bins=bins,
+        alpha=0.9,
+        label="true label (true shell)",
+    )
+    axes[1].hist(
+        val_wrong_scores,
+        bins=bins,
+        alpha=0.75,
+        label="network score (wrong shell)",
+    )
+    axes[1].hist(
+        val_true_scores,
+        bins=bins,
+        alpha=0.75,
+        label="network score (true shell)",
+    )
+    axes[1].axvline(
+        random_prob,
+        linestyle="--",
+        linewidth=1.0,
+        label=f"random = {random_prob:.3f}",
+    )
     axes[1].set_yscale("log")
+    axes[1].set_xlabel(r"$P(\mathrm{shell})$")
     axes[1].set_ylabel("Count")
-    axes[1].set_xlabel(r"$y_{CNP}$")
-    axes[1].set_title(f"Validation: Inside-Theta Monitor (loss {val_loss:.4f})", fontsize=10)
+    axes[1].set_title(
+        f"Validation: Shell Probability Monitor "
+        f"(CE {val_loss:.4f}, acc {val_acc:.3f}, MAE {val_mae:.2f})",
+        fontsize=9,
+    )
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(fontsize=8)
 
-    handles0, labels0 = axes[0].get_legend_handles_labels()
-    if handles0:
-        axes[0].legend(loc="upper right", fontsize=8, frameon=True)
-    handles1, labels1 = axes[1].get_legend_handles_labels()
-    if handles1:
-        axes[1].legend(loc="upper right", fontsize=8, frameon=True)
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+def _plot_training_history(df: pd.DataFrame, out_path: Path) -> None:
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+
+    ax.plot(df["step"], df["train_ce"], label="train CE")
+    ax.plot(df["step"], df["val_ce"], label="val CE")
+    ax.set_xlabel("step")
+    ax.set_ylabel("Cross entropy")
+    ax.set_title("CNP categorical training history")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _plot_sample_shell_predictions(
+    pred_shell: np.ndarray,
+    true_shell: np.ndarray,
+    out_path: Path,
+) -> None:
+    pred_shell = np.asarray(pred_shell).reshape(-1)
+    true_shell = np.asarray(true_shell).reshape(-1)
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+
+    ax.scatter(true_shell + 1, pred_shell + 1, s=8, alpha=0.4)
+
+    lo = 1
+    hi = max(int(true_shell.max()) + 1, int(pred_shell.max()) + 1)
+    ax.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1.0)
+
+    ax.set_xlabel("true shell index")
+    ax.set_ylabel("predicted shell index")
+    ax.set_title("Sample Batch: Predicted vs True Shell")
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
@@ -651,21 +856,24 @@ def train_cnp(
 
     pool = H5EventPool(
         runtime.train_dir,
-        theta_headers=runtime.theta_headers,
         phi_headers=runtime.phi_headers,
         target_headers=runtime.target_headers,
+        n_shells=runtime.n_shells,
         seed=runtime.seed,
         cache_files=True,
     )
-
-    x_dim = len(runtime.theta_headers) + len(runtime.phi_headers)
-    y_dim = len(runtime.target_headers)
+    
+    x_dim = len(runtime.phi_headers)
+    y_dim = runtime.n_shells
 
     model = DeterministicCNP(x_dim=x_dim, y_dim=y_dim, repr_dim=repr_dim, hidden=hidden, dropout=dropout)
 
     dev = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
     model.to(dev)
 
+    class_weights = compute_shell_class_weights(pool, n_shells=runtime.n_shells, beta=0.999, max_weight=20.0).to(dev)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     rng = np.random.default_rng(runtime.seed)
 
@@ -685,21 +893,19 @@ def train_cnp(
         total_train_events = pool.total_events()
         approx_batches_per_epoch = int(np.ceil(total_train_events / runtime.batch_size_train))
         print(
-            "[info] Full-pass dataloader mode is enabled. "
+            "\n[info] Full-pass dataloader mode is enabled. "
             f"Each epoch sees all {total_train_events} training events in ≈{approx_batches_per_epoch} batches."
         )
     else:
         print(
-            "[info] Random mini-batch mode is enabled. "
+            "\n[info] Random mini-batch mode is enabled. "
             f"Each epoch uses {effective_steps_per_epoch} sampled steps."
         )
-
-    #k = runtime.negative_shells
-    #pos_weight = torch.tensor([k], dtype=torch.float32, device=dev)
     
     for epoch in range(runtime.epochs):
         model.train()
         epoch_steps = 0
+        
         if training_mode == "full_pass":
             batch_iter: Iterable[EventBatch] = pool.iter_epoch_batches(
                 runtime.batch_size_train,
@@ -707,113 +913,159 @@ def train_cnp(
                 shuffle=True,
                 drop_last=False,
             )
+            epoch_total = approx_batches_per_epoch
         else:
             batch_iter = (
                 pool.sample_batch(runtime.batch_size_train, runtime.files_per_batch_train)
                 for _ in range(effective_steps_per_epoch)
             )
+            epoch_total = effective_steps_per_epoch
 
-        for batch in batch_iter:
+        epoch_pbar = tqdm(
+            batch_iter,
+            total=epoch_total,
+            desc=f"Epoch {epoch+1}/{runtime.epochs}",
+            unit="batch",
+            leave=True,
+        )
+
+        running_train_ce: list[float] = []
+        running_val_ce: list[float] = []
+        running_train_acc: list[float] = []
+        running_val_acc: list[float] = []
+        running_train_mae: list[float] = []
+        running_val_mae: list[float] = []
+
+        for batch in epoch_pbar:
             if batch.x.shape[0] < 4:
                 continue
             x = batch.x.to(dev)
-            y = batch.y.to(dev)
+            y = batch.y.to(dev).long()
 
-            cx, cy, tx, ty = split_context_target(x, y, runtime.context_ratio, rng, context_mode=runtime.context_mode)
-            logits, sigma = model(cx, cy, tx)
-            train_bce = F.binary_cross_entropy_with_logits(logits, ty)
+            cx, cy, tx, ty = split_context_target_class(
+                x, y, 
+                n_classes=runtime.n_shells, 
+                context_ratio=runtime.context_ratio, 
+                rng=rng, 
+                context_mode=runtime.context_mode,
+            )
+            logits, _sigma = model(cx, cy, tx)
+            train_ce = criterion(logits, ty)
 
             optimizer.zero_grad()
-            train_bce.backward()
+            train_ce.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             # Validation step from an independent sampled mini-batch.
             with torch.no_grad():
-                val_batch = pool.sample_batch(val_batch_size, max(1, runtime.files_per_batch_train // 2))
-                vx = val_batch.x.to(dev)
-                vy = val_batch.y.to(dev)
-                vcx, vcy, vtx, vty = split_context_target(
-                    vx, vy, runtime.context_ratio, rng, context_mode=runtime.context_mode
+                val_batch = pool.sample_batch(
+                    val_batch_size,
+                    max(1, runtime.files_per_batch_train // 2),
                 )
-                vlogits, vsigma = model(vcx, vcy, vtx)
-                val_bce = F.binary_cross_entropy_with_logits(vlogits, vty)
-
+            
+                vx = val_batch.x.to(dev)
+                vy = val_batch.y.to(dev).long()
+            
+                vcx, vcy, vtx, vty = split_context_target_class(
+                    vx,
+                    vy,
+                    n_classes=runtime.n_shells,
+                    context_ratio=runtime.context_ratio,
+                    rng=rng,
+                    context_mode=runtime.context_mode,
+                )
+            
+                vlogits, _vsigma = model(vcx, vcy, vtx)
+                val_ce = criterion(vlogits, vty)
+            
+                pred_shell = torch.argmax(logits, dim=-1)
+                val_pred_shell = torch.argmax(vlogits, dim=-1)
+            
+                train_acc = (pred_shell == ty).float().mean()
+                val_acc = (val_pred_shell == vty).float().mean()
+            
+                train_mae = (pred_shell.float() - ty.float()).abs().mean()
+                val_mae = (val_pred_shell.float() - vty.float()).abs().mean()
+            
             history_rows.append(
                 {
                     "epoch": float(epoch),
                     "step": float(global_step),
-                    "train_bce": float(train_bce.item()),
-                    "val_bce": float(val_bce.item()),
+                    "train_ce": float(train_ce.item()),
+                    "val_ce": float(val_ce.item()),
+                    "train_acc": float(train_acc.item()),
+                    "val_acc": float(val_acc.item()),
+                    "train_mae_shell": float(train_mae.item()),
+                    "val_mae_shell": float(val_mae.item()),
+                }
+            )
+
+            # Log data for epoch progress bar
+            running_train_ce.append(float(train_ce.item()))
+            running_val_ce.append(float(val_ce.item()))
+            running_train_acc.append(float(train_acc.item()))
+            running_val_acc.append(float(val_acc.item()))
+            running_train_mae.append(float(train_mae.item()))
+            running_val_mae.append(float(val_mae.item()))
+            
+            # Keep only recent values so the displayed average reacts during training.
+            window = 100
+            running_train_ce = running_train_ce[-window:]
+            running_val_ce = running_val_ce[-window:]
+            running_train_acc = running_train_acc[-window:]
+            running_val_acc = running_val_acc[-window:]
+            running_train_mae = running_train_mae[-window:]
+            running_val_mae = running_val_mae[-window:]
+            
+            epoch_pbar.set_postfix(
+                {
+                    "train_ce": f"{np.mean(running_train_ce):.4f}",
+                    "val_ce": f"{np.mean(running_val_ce):.4f}",
+                    "train_acc": f"{np.mean(running_train_acc):.3f}",
+                    "val_acc": f"{np.mean(running_val_acc):.3f}",
+                    "train_mae": f"{np.mean(running_train_mae):.2f}",
+                    "val_mae": f"{np.mean(running_val_mae):.2f}",
                 }
             )
 
             if monitor_every > 0 and global_step % monitor_every == 0:
                 ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(
-                    f"{ts} Iteration: {epoch}/{global_step}, "
-                    f"train BCE: {train_bce.item():.4f}, val BCE: {val_bce.item():.4f}"
-                )
-
-                with torch.no_grad():
-                    train_prob = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
-                    train_true = ty.detach().cpu().numpy().reshape(-1)
-                    val_prob = torch.sigmoid(vlogits).detach().cpu().numpy().reshape(-1)
-                    val_true = vty.detach().cpu().numpy().reshape(-1)
-
-                monitor_plot = runtime.out_dir / f"cnp_{runtime.version}_monitor_step_{global_step}.png"
-                _plot_train_val_snapshot(
-                    train_pred=train_prob,
-                    train_truth=train_true,
-                    val_pred=val_prob,
-                    val_truth=val_true,
-                    out_path=monitor_plot,
-                    step=global_step,
-                    train_loss=float(train_bce.item()),
-                    val_loss=float(val_bce.item()),
-                    target_range=runtime.target_range,
-                )
-                latest_plot = runtime.out_dir / f"cnp_{runtime.version}_monitor_latest.png"
-                _plot_train_val_snapshot(
-                    train_pred=train_prob,
-                    train_truth=train_true,
-                    val_pred=val_prob,
-                    val_truth=val_true,
-                    out_path=latest_plot,
-                    step=global_step,
-                    train_loss=float(train_bce.item()),
-                    val_loss=float(val_bce.item()),
-                    target_range=runtime.target_range,
-                )
-                if show_monitor_plots:
-                    try:
-                        from IPython.display import Image, display
-                        display(Image(filename=str(monitor_plot)))
-                    except Exception:
-                        pass
-
+            
                 hist_df_live = pd.DataFrame(history_rows)
                 history_csv_live = runtime.out_dir / f"cnp_{runtime.version}_history_{runtime.epochs}epochs.csv"
                 hist_df_live.to_csv(history_csv_live, index=False)
+            
                 history_plot_live = runtime.out_dir / f"cnp_{runtime.version}_training_curve_{runtime.epochs}epochs.png"
                 _plot_training_history(hist_df_live, history_plot_live)
+                
+                latest_plot = runtime.out_dir / f"cnp_{runtime.version}_class_monitor_latest.png"
+                _plot_train_val_shell_probability_snapshot(
+                    train_logits=logits,
+                    train_true_shell=ty,
+                    val_logits=vlogits,
+                    val_true_shell=vty,
+                    out_path=latest_plot,
+                    step=global_step,
+                    train_loss=float(train_ce.item()),
+                    val_loss=float(val_ce.item()),
+                    n_shells=runtime.n_shells,
+                )
 
+                if show_monitor_plots:
+                    try: 
+                        from IPython.display import Image, display
+                        display(Image(filename=str(latest_plot)))
+                    except Exception as e:
+                        print(f"[warn] Could not display monitor plot inline: {e}")
+                        print(f"[info] Monitor plot saved to {latest_plot}")
+                        
             global_step += 1
             epoch_steps += 1
 
-        latest = history_rows[-1]
-        print(
-            f"Epoch {epoch + 1}/{runtime.epochs} | "
-            f"step={int(latest['step'])} | "
-            f"epoch_steps={epoch_steps} | "
-            f"train_bce={latest['train_bce']:.5f} | "
-            f"val_bce={latest['val_bce']:.5f}"
-        )
-
     # Save model and artifacts.
     model_path = runtime.out_dir / f"cnp_{runtime.version}_model_{runtime.epochs}epochs.pth"
-    torch.save(
-        {
+    torch.save({
             "state_dict": model.state_dict(),
             "x_dim": x_dim,
             "y_dim": y_dim,
@@ -822,15 +1074,15 @@ def train_cnp(
             "dropout": dropout,
             "encoder_sizes": [x_dim + y_dim, 32, 64, 128, 128, 128, 64, 48, repr_dim],
             "decoder_sizes": [x_dim + repr_dim, 32, 64, 128, 128, 128, 64, 48, y_dim * 2],
-            "theta_headers": runtime.theta_headers,
             "phi_headers": runtime.phi_headers,
             "target_headers": runtime.target_headers,
+            "n_shells": runtime.n_shells,
             "epochs": runtime.epochs,
             "training_mode": training_mode,
             "context_mode": runtime.context_mode,
             "version": runtime.version,
-        },
-        model_path,
+            "loss": "weighted_categorical_cross_entropy",
+        }, model_path,
     )
 
     hist_df = pd.DataFrame(history_rows)
@@ -843,16 +1095,29 @@ def train_cnp(
     # One sample-batch qualitative prediction plot.
     model.eval()
     with torch.no_grad():
-        sample = pool.sample_batch(min(4096, runtime.batch_size_train), runtime.files_per_batch_train)
+        sample = pool.sample_batch(
+            min(4096, runtime.batch_size_train),
+            runtime.files_per_batch_train,
+        )
+    
         sx = sample.x.to(dev)
-        sy = sample.y.to(dev)
-        scx, scy, stx, sty = split_context_target(sx, sy, runtime.context_ratio, rng, context_mode=runtime.context_mode)
-        slogits, ssigma = model(scx, scy, stx)
-        probs = torch.sigmoid(slogits).cpu().numpy().reshape(-1)
-        truth = sty.cpu().numpy().reshape(-1)
-
+        sy = sample.y.to(dev).long()
+    
+        scx, scy, stx, sty = split_context_target_class(
+            sx,
+            sy,
+            n_classes=runtime.n_shells,
+            context_ratio=runtime.context_ratio,
+            rng=rng,
+            context_mode=runtime.context_mode,
+        )
+    
+        slogits, _ssigma = model(scx, scy, stx)
+        pred_shell = torch.argmax(slogits, dim=-1).cpu().numpy()
+        truth_shell = sty.cpu().numpy()
+    
     sample_plot = runtime.out_dir / f"cnp_{runtime.version}_sample_predictions_{runtime.epochs}epochs.png"
-    _plot_sample_predictions(probs, truth, sample_plot)
+    _plot_sample_shell_predictions(pred_shell, truth_shell, sample_plot)
 
     return TrainResult(
         model_path=model_path,
@@ -881,157 +1146,6 @@ def load_model_checkpoint(model_path: str | Path, device: Optional[str] = None) 
     model.eval()
     return model
 
-
-def _safe_log_bernoulli(y_true: np.ndarray, y_prob: np.ndarray, eps: float = 1e-6) -> float:
-    p = np.clip(y_prob, eps, 1 - eps)
-    y = np.clip(y_true, 0, 1)
-    ll = y * np.log(p) + (1 - y) * np.log(1 - p)
-    return float(ll.mean())
-
-
-def _bce_numpy(y_true: np.ndarray, y_prob: np.ndarray, eps: float = 1e-6) -> float:
-    return float(-_safe_log_bernoulli(y_true, y_prob, eps=eps))
-
-
-def _plot_prediction_heatmaps(
-    df: pd.DataFrame,
-    theta_headers: Sequence[str],
-    out_path: Path,
-    err_out_path: Path,
-) -> None:
-    x_name, y_name = theta_headers[0], theta_headers[1]
-    x = df[x_name].to_numpy(dtype=float)
-    y = df[y_name].to_numpy(dtype=float)
-    y_raw = df["y_raw"].to_numpy(dtype=float)
-    y_cnp = df["y_cnp"].to_numpy(dtype=float)
-
-    # Filter non-finite rows first to prevent interpolation failures.
-    finite_mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(y_raw) & np.isfinite(y_cnp)
-    x = x[finite_mask]
-    y = y[finite_mask]
-    y_raw = y_raw[finite_mask]
-    y_cnp = y_cnp[finite_mask]
-
-    # Robust bounds: focus on the main cluster and ignore extreme outliers.
-    if len(x) >= 20:
-        q_lo, q_hi = 0.02, 0.98
-        x_lo_q, x_hi_q = np.quantile(x, [q_lo, q_hi])
-        y_lo_q, y_hi_q = np.quantile(y, [q_lo, q_hi])
-        inlier_mask = (x >= x_lo_q) & (x <= x_hi_q) & (y >= y_lo_q) & (y <= y_hi_q)
-        if int(inlier_mask.sum()) >= 8:
-            x = x[inlier_mask]
-            y = y[inlier_mask]
-            y_raw = y_raw[inlier_mask]
-            y_cnp = y_cnp[inlier_mask]
-
-    x_min, x_max = float(np.min(x)), float(np.max(x))
-    y_min, y_max = float(np.min(y)), float(np.max(y))
-    x_span = max(x_max - x_min, 1e-9)
-    y_span = max(y_max - y_min, 1e-9)
-    # Small padding to avoid clipping markers on edges.
-    pad_frac = 0.01
-    x_lo, x_hi = x_min - pad_frac * x_span, x_max + pad_frac * x_span
-    y_lo, y_hi = y_min - pad_frac * y_span, y_max + pad_frac * y_span
-
-    def _interp_grid(px: np.ndarray, py: np.ndarray, pv: np.ndarray, n: int = 100) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-        gx, gy = np.mgrid[x_lo:x_hi:complex(0, n), y_lo:y_hi:complex(0, n)]
-        try:
-            from scipy.interpolate import griddata  # type: ignore
-
-            gz = griddata((px, py), pv, (gx, gy), method="cubic")
-            if gz is None:
-                return gx, gy, None
-            if np.isnan(gz).all():
-                gz = griddata((px, py), pv, (gx, gy), method="linear")
-            return gx, gy, gz
-        except Exception:
-            return gx, gy, None
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    used_contour = len(x) >= 4
-    if used_contour:
-        grid_x, grid_y, grid_y_raw = _interp_grid(x, y, y_raw, n=100)
-        _, _, grid_y_cnp = _interp_grid(x, y, y_cnp, n=100)
-        if grid_y_raw is None or grid_y_cnp is None:
-            used_contour = False
-        else:
-            im1 = axes[0].contourf(grid_x, grid_y, grid_y_raw, levels=20, cmap="viridis")
-            axes[0].scatter(x, y, c=y_raw, s=10, cmap="viridis", edgecolor="white", linewidth=0.5, alpha=0.6)
-            axes[0].set_xlabel(x_name, fontsize=12)
-            axes[0].set_ylabel(y_name, fontsize=12)
-            axes[0].set_title("Observed Theta Occupancy Fraction (y_raw)", fontsize=14, fontweight="bold")
-            cb1 = plt.colorbar(im1, ax=axes[0])
-            cb1.set_label("inside-theta fraction", fontsize=11)
-
-            im2 = axes[1].contourf(grid_x, grid_y, grid_y_cnp, levels=20, cmap="viridis")
-            axes[1].scatter(x, y, c=y_cnp, s=10, cmap="viridis", edgecolor="white", linewidth=0.5, alpha=0.6)
-            axes[1].set_xlabel(x_name, fontsize=12)
-            axes[1].set_ylabel(y_name, fontsize=12)
-            axes[1].set_title("CNP-Predicted Theta Occupancy Fraction (y_cnp)", fontsize=14, fontweight="bold")
-            cb2 = plt.colorbar(im2, ax=axes[1])
-            cb2.set_label("inside-theta fraction", fontsize=11)
-
-    if not used_contour:
-        s1 = axes[0].scatter(x, y, c=y_raw, cmap="viridis", s=45, edgecolor="k", linewidth=0.2)
-        axes[0].set_title("Observed Theta Occupancy Fraction (y_raw)", fontsize=14, fontweight="bold")
-        axes[0].set_xlabel(x_name)
-        axes[0].set_ylabel(y_name)
-        cb1 = plt.colorbar(s1, ax=axes[0])
-        cb1.set_label("inside-theta fraction")
-
-        s2 = axes[1].scatter(x, y, c=y_cnp, cmap="viridis", s=45, edgecolor="k", linewidth=0.2)
-        axes[1].set_title("CNP-Predicted Theta Occupancy Fraction (y_cnp)", fontsize=14, fontweight="bold")
-        axes[1].set_xlabel(x_name)
-        axes[1].set_ylabel(y_name)
-        cb2 = plt.colorbar(s2, ax=axes[1])
-        cb2.set_label("inside-theta fraction")
-
-    axes[0].set_xlim(x_lo, x_hi)
-    axes[1].set_xlim(x_lo, x_hi)
-    axes[0].set_ylim(y_lo, y_hi)
-    axes[1].set_ylim(y_lo, y_hi)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
-
-    err = y_cnp - y_raw
-    vmax = float(np.max(np.abs(err))) if len(err) else 1.0
-    vmax = vmax if vmax > 1e-12 else 1.0
-
-    fig2, ax2 = plt.subplots(1, 1, figsize=(8, 6))
-    if used_contour:
-        grid_x, grid_y, grid_diff = _interp_grid(x, y, err, n=100)
-        if grid_diff is not None:
-            im_diff = ax2.contourf(grid_x, grid_y, grid_diff, levels=20, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-            ax2.scatter(x, y, c=err, s=10, cmap="RdBu_r", vmin=-vmax, vmax=vmax, edgecolor="white", linewidth=0.5, alpha=0.6)
-            cbe = plt.colorbar(im_diff, ax=ax2)
-        else:
-            se = ax2.scatter(x, y, c=err, cmap="RdBu_r", vmin=-vmax, vmax=vmax, s=50, edgecolor="none")
-            cbe = plt.colorbar(se, ax=ax2)
-    else:
-        se = ax2.scatter(x, y, c=err, cmap="RdBu_r", vmin=-vmax, vmax=vmax, s=50, edgecolor="none")
-        cbe = plt.colorbar(se, ax=ax2)
-
-    ax2.set_title("Theta Occupancy Fraction Error (y_cnp - y_raw)", fontsize=14, fontweight="bold")
-    ax2.set_xlabel(x_name, fontsize=12)
-    ax2.set_ylabel(y_name, fontsize=12)
-    ax2.set_xlim(x_lo, x_hi)
-    ax2.set_ylim(y_lo, y_hi)
-    cbe.set_label("fraction error", fontsize=11)
-
-    fig2.tight_layout()
-    fig2.savefig(err_out_path, dpi=180)
-    plt.close(fig2)
-
-def read_h5_meta(file_path: Path) -> dict[str, np.ndarray]:
-    meta: dict[str, np.ndarray] = {}
-    with h5py.File(file_path, "r") as f:
-        if "meta" not in f:
-            return meta
-        for key in f["meta"].keys():
-            meta[key] = np.asarray(f["meta"][key])
-    return meta
 
 def shell_boundaries(r_max: float, z_max:float , shells: int, power: float) -> pd.DataFrame:
     idx = np.arange(0, shells + 1, dtype=float)
@@ -1065,23 +1179,6 @@ def full_shell_table(r_max: float, z_max:float , shells: int, power: float) -> p
 
     return pd.DataFrame(rows)
 
-def unique_events_from_h5_file(
-    file_path: Path,
-    phi_headers: Sequence[str],
-) -> pd.DataFrame:
-    with h5py.File(file_path, "r") as f:
-        phi = np.asarray(f["phi"], dtype=np.float32)
-    meta = read_h5_meta(file_path)
-
-    if "event_index" in meta:
-        event_index = meta["event_index"].astype(np.int64)
-    else:
-        event_index = np.arange(len(phi), dtype=np.int64)
-
-    event_df = pd.DataFrame(phi, columns=phi_headers)
-    event_df["event_index"] = event_index
-
-    return event_df.drop_duplicates(subset=["event_index"]).sort_values("event_index").reset_index(drop=True)
 
 def predict_cnp(
     runtime: CNPRuntimeConfig,
@@ -1095,17 +1192,21 @@ def predict_cnp(
     runtime.out_dir.mkdir(parents=True, exist_ok=True)
     set_seed(runtime.seed)
 
+    if model_path is None:
+        raise ValueError("Model Path must be provided when running prediction")
     model_path = Path(model_path)
     model = load_model_checkpoint(model_path, device=device)
     dev = next(model.parameters()).device
 
     if output_epochs is None:
         output_epochs = runtime.epochs
+    if output_suffix is None:
+        output_suffix = "event_shell_distribution"
 
     # Get the shell table for all shells
     r_max, z_max, shells, power = runtime.R_max, runtime.Z_max, runtime.n_shells, runtime.scale_power
     shell_table = full_shell_table(r_max, z_max, shells, power)
-    shell_theta = shell_table[list(runtime.theta_headers)].to_numpy(dtype=np.float32)
+    shell_geom = shell_table[["shell_index", *runtime.theta_headers]].copy()
     shell_indices = shell_table["shell_index"].to_numpy(dtype=np.int32)
     n_shells = len(shell_table)
 
@@ -1129,15 +1230,11 @@ def predict_cnp(
     write_all_header = True
     write_best_header = True
     total_event_count = 0
-    total_pair_count = 0
 
     agg_chunks: list[pd.DataFrame] = []
 
     print("\n" + "=" * 80)
     print("Starting CNP prediction")
-    print(f"MFGP CSV:       {mfgp_csv}")
-    print(f"All-shell CSV:  {all_shell_csv}")
-    print(f"Best-shell CSV: {best_shell_csv}")
     print("=" * 80)
     
     for i, pred_dir in enumerate(runtime.predict_dirs):
@@ -1162,9 +1259,9 @@ def predict_cnp(
 
         pool = H5EventPool(
             pred_dir,
-            theta_headers=runtime.theta_headers,
             phi_headers=runtime.phi_headers,
             target_headers=runtime.target_headers,
+            n_shells=runtime.n_shells,
             seed=runtime.seed + i,
             cache_files=False,
         )
@@ -1172,8 +1269,8 @@ def predict_cnp(
         # Setup tqdm progress bar
         files = list(Path(pred_dir).glob("*.h5"))
         with tqdm(total=len(files), desc=f"{dataset_type}", unit="block") as pbar:
-            for file_path, x_np, y_np, theta_np in pool.iter_file_data():
-                n = len(y_np)
+            for file_path, phi_np, target_shell_np, meta in pool.iter_file_data():
+                n = len(target_shell_np)
                 if n == 0:
                     pbar.update(1)
                     continue
@@ -1184,87 +1281,44 @@ def predict_cnp(
                 n_context = min(n_context, n - 1)
                 c_idx = rng.choice(n, size=n_context, replace=False)
     
-                context_x = torch.from_numpy(x_np[c_idx]).to(dev)
-                context_y = torch.from_numpy(y_np[c_idx]).to(dev)
-
+                context_x = torch.from_numpy(phi_np[c_idx]).to(dev)
+                context_y_idx = torch.from_numpy(target_shell_np[c_idx]).long().to(dev)
+                context_y = F.one_hot(context_y_idx, num_classes=n_shells).float()
+                
                 # Recover true positive shell per event from metadata
-                meta = read_h5_meta(file_path)
-                if "event_index" not in meta:
-                    raise ValueError(f"{file_path.name}: missing meta/event_index")
-                true_shell_lookup: dict[int, int] = {}
-                if "event_index" in meta and "shell_index" in meta and "pair_type" in meta:
-                    meta_event_index = meta["event_index"].astype(np.int64)
-                    meta_shell_index = meta["shell_index"].astype(np.int32)
-                    pair_type_raw = meta["pair_type"]
-                    pair_type = np.array(
-                        [
-                            x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x)
-                            for x in pair_type_raw
-                        ]
-                    )
-                    positive_mask = pair_type == "positive"
-                    true_shell_lookup = dict(
-                        zip(
-                            meta_event_index[positive_mask],
-                            meta_shell_index[positive_mask],
-                        )
-                    )
+                if "event_index" in meta:
+                    event_indices = meta["event_index"].astype(np.int64)
+                else:
+                    event_indices = np.arange(len(phi_np), dtype=np.int64)
+
+                true_shell_one = target_shell_np.astype(np.int64) + 1
                     
                 # Grab event wise data
-                event_df = unique_events_from_h5_file(
-                    file_path=file_path,
-                    phi_headers=runtime.phi_headers,
-                )
-                event_phi = event_df[list(runtime.phi_headers)].to_numpy(dtype=np.float32)
-                event_indices = event_df["event_index"].to_numpy(dtype=np.int64)
-                events_per_chunk = max(1, chunk_size // n_shells)
+                events_per_chunk = max(1, chunk_size)
     
-                for event_start in range(0, len(event_df), events_per_chunk):
-                    event_end = min(len(event_df), event_start+events_per_chunk)
+                for event_start in range(0, len(phi_np), events_per_chunk):
+                    event_end = min(len(phi_np), event_start + events_per_chunk)
     
-                    phi_chunk = event_phi[event_start:event_end]
+                    phi_chunk = phi_np[event_start:event_end]
                     event_index_chunk = event_indices[event_start:event_end]
+                    true_shell_one_chunk = true_shell_one[event_start:event_end]
                     n_events_chunk = len(phi_chunk)
     
                     if n_events_chunk == 0:
                         continue
 
-                    true_shell_chunk = np.array(
-                        [
-                            true_shell_lookup.get(int(event_index), -1)
-                            for event_index in event_index_chunk
-                        ],
-                        dtype=np.int32,
-                    )
-                    
-                    theta_expanded = np.tile(shell_theta, (n_events_chunk, 1))
-                    phi_expanded = np.repeat(phi_chunk, repeats=n_shells, axis=0)
-    
-                    x_target_np = np.hstack([theta_expanded, phi_expanded]).astype(np.float32)
-                    mu_parts: list[np.ndarray] = []
-                    std_parts: list[np.ndarray] = []
-    
+                    target_x = torch.from_numpy(phi_chunk).to(dev)
                     with torch.no_grad():
-                        for row_start in range(0, len(x_target_np), chunk_size):
-                            row_end = min(len(x_target_np), row_start + chunk_size)
-    
-                            target_x = torch.from_numpy(x_target_np[row_start:row_end]).to(dev)
-    
-                            mu_t, std_t = model.predict_proba_mc(
-                                context_x,
-                                context_y,
-                                target_x,
-                                mc_samples=mc_samples,
-                            )
-    
-                            mu_parts.append(mu_t.cpu().numpy())
-                            std_parts.append(std_t.cpu().numpy())
-                    mu = np.vstack(mu_parts).reshape(-1)
-                    std = np.vstack(std_parts).reshape(-1)
+                        prob_t, std_t = model.predict_proba_mc(context_x, context_y, target_x, mc_samples=mc_samples)
 
+                    probs = prob_t.cpu().numpy() # (N_events_chunk, n_shells)
+                    stds = std_t.cpu().numpy()  # (N_events_chunk, n_shells)
+
+                    n_events_chunk = len(phi_chunk)
+                    
                     repeated_event_index = np.repeat(event_index_chunk, repeats=n_shells)
                     tiled_shell_index = np.tile(shell_indices, reps=n_events_chunk)
-                    repeated_true_shell = np.repeat(true_shell_chunk, repeats=n_shells)
+                    repeated_true_shell = np.repeat(true_shell_one_chunk, repeats=n_shells)
                     
                     out = pd.DataFrame({
                             "iteration": float(iteration),
@@ -1273,27 +1327,44 @@ def predict_cnp(
                             "event_index": repeated_event_index,
                             "shell_index": tiled_shell_index,
                             "true_shell_index": repeated_true_shell,
-                            "y_cnp": mu,
-                            "y_cnp_err": std,
-                        })
-                    for theta_col_idx, theta_name in enumerate(runtime.theta_headers):
-                        out[theta_name] = theta_expanded[:, theta_col_idx]
+                            "y_cnp": probs.reshape(-1),
+                            "y_cnp_err": stds.reshape(-1),
+                    })
+                    
+                    out["y_raw"] = (
+                        out["shell_index"].to_numpy(dtype=np.int32)
+                        == out["true_shell_index"].to_numpy(dtype=np.int32)
+                    ).astype(float)
+                    
+                    # Already normalized by softmax
+                    out["p_shell"] = out["y_cnp"]
+                    out = out.merge(shell_geom, on="shell_index", how="left")
 
-                    # Save to csv
-                    out["y_raw"] = out["shell_index"].to_numpy(dtype=np.int32) == out["true_shell_index"].to_numpy(dtype=np.int32).astype(float)
-                    prob_sum = out.groupby("event_index")["y_cnp"].transform("sum")
-                    out["p_shell"] = np.where(prob_sum > 0, out["y_cnp"] / prob_sum, 0.0)
-                        
-                    best_idx = out.groupby("event_index")["p_shell"].idxmax()
-                    best_chunk = out.loc[best_idx].copy()
-    
-                    best_chunk = best_chunk.rename(
-                        columns = {
-                            "shell_index": "predicted_shell_index",
-                            "p_shell": "predicted_shell_probability",
-                            "y_cnp": "predicted_shell_score"
-                        })
-                
+                    best_zero = np.argmax(probs, axis=1)
+                    best_one = best_zero + 1
+
+                    best_chunk = pd.DataFrame({
+                            "iteration": float(iteration),
+                            "fidelity": float(fidelity),
+                            "source_file": file_path.name,
+                            "event_index": event_index_chunk,
+                            "true_shell_index": true_shell_one_chunk,
+                            "predicted_shell_index": best_one.astype(np.int32),
+                            "predicted_shell_probability": probs[np.arange(n_events_chunk), best_zero],
+                            "predicted_shell_score": probs[np.arange(n_events_chunk), best_zero],
+                            "y_cnp_err": stds[np.arange(n_events_chunk), best_zero],
+                    })
+                    
+                    best_chunk = best_chunk.merge(
+                        shell_geom.rename(
+                            columns={
+                                "shell_index": "predicted_shell_index",
+                            }
+                        ),
+                        on="predicted_shell_index",
+                        how="left",
+                    )
+                    
                     out.to_csv(all_shell_csv, mode="w" if write_all_header else "a", header=write_all_header, index=False)
                     write_all_header = False
     
@@ -1321,25 +1392,21 @@ def predict_cnp(
                         agg_chunks.append(agg_chunk)
                     
                     total_event_count += n_events_chunk
-                    total_pair_count += len(out)
                     
                     # Cleanup for data management
-                    del theta_expanded, phi_expanded, x_target_np
-                    del out, best_chunk
-                    del mu_parts, std_parts, mu, std
+                    del out, best_chunk, probs, stds, target_x
 
                     if "agg_source" in locals():
                         del agg_source
                     if "agg_chunk" in locals():
                         del agg_chunk
                 
-                del context_x, context_y, x_np, y_np
+                del context_x, context_y, phi_np, target_shell_np
                 
                 # Update progress bar
                 pbar.update(1)
                 pbar.set_postfix(
                     events=f"{total_event_count:,}",
-                    pairs=f"{total_pair_count:,}"
                 )
 
     required_cols = [
@@ -1401,9 +1468,11 @@ def predict_cnp(
     else:
         pd.DataFrame(columns=required_cols).to_csv(mfgp_csv, index=False)
 
-    print(f"Saved MFGP compatable CNP CSV: {mfgp_csv}")
-    print(f"Saved all event-shell probabilities: {all_shell_csv}")
-    print(f"Saved best shell per event: {best_shell_csv}")
+    print("\n" + "=" * 80)
+    print(f"MFGP CSV:       {mfgp_csv}")
+    print(f"All-shell CSV:  {all_shell_csv}")
+    print(f"Best-shell CSV: {best_shell_csv}")
+    print("=" * 80)
 
     return PredictResult(
         all_path=all_shell_csv,
@@ -1416,24 +1485,62 @@ def predict_cnp(
 # -----------------------------
 
 
+def _experiment_result_dict(
+    *,
+    config_path: Path,
+    validation_config_path: Path,
+    train_result: TrainResult,
+    predict_result_train: PredictResult,
+    predict_result_validation: PredictResult,
+) -> Dict[str, str]:
+    return {
+        "config_path": str(config_path),
+        "validation_config_path": str(validation_config_path),
+
+        "model_path": str(train_result.model_path),
+        "history_csv": str(train_result.history_csv),
+        "history_plot": str(train_result.history_plot),
+        "sample_plot": str(train_result.sample_plot),
+
+        "train_all_shell_csv": str(predict_result_train.all_path),
+        "train_best_shell_csv": str(predict_result_train.best_path),
+        "train_mfgp_csv": str(predict_result_train.mfgp_path),
+
+        "validation_all_shell_csv": str(predict_result_validation.all_path),
+        "validation_best_shell_csv": str(predict_result_validation.best_path),
+        "validation_mfgp_csv": str(predict_result_validation.mfgp_path),
+    }
+
+
 def run_minibatch_experiment(
     *,
     seed: int = 42,
     device: Optional[str] = None,
 ) -> Dict[str, str]:
-    config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_minibatch.yaml").resolve()
-    validation_config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_validation_minibatch.yaml").resolve()
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "xlzd"
+        / "settings_minibatch.yaml"
+    ).resolve()
+
+    validation_config_path = (
+        Path(__file__).resolve().parents[1]
+        / "xlzd"
+        / "settings_validation_minibatch.yaml"
+    ).resolve()
 
     runtime = load_runtime_config(config_path, seed=seed)
     validation_runtime = load_runtime_config(validation_config_path, seed=seed)
 
     train_result = train_cnp(runtime, device=device)
+
     predict_result_train = predict_cnp(
         runtime,
         model_path=train_result.model_path,
         chunk_size=20000,
         device=device,
     )
+
     predict_result_validation = predict_cnp(
         validation_runtime,
         model_path=train_result.model_path,
@@ -1441,20 +1548,14 @@ def run_minibatch_experiment(
         device=device,
     )
 
-    result = {
-        "config_path": str(config_path),
-        "validation_config_path": str(validation_config_path),
-        "model_path": str(train_result.model_path),
-        "history_csv": str(train_result.history_csv),
-        "history_plot": str(train_result.history_plot),
-        "sample_plot": str(train_result.sample_plot),
-        "train_csv": str(predict_result_train.csv_path),
-        "train_heatmap": str(predict_result_train.heatmap_path),
-        "train_error_heatmap": str(predict_result_train.error_heatmap_path),
-        "validation_csv": str(predict_result_validation.csv_path),
-        "validation_heatmap": str(predict_result_validation.heatmap_path),
-        "validation_error_heatmap": str(predict_result_validation.error_heatmap_path),
-    }
+    result = _experiment_result_dict(
+        config_path=config_path,
+        validation_config_path=validation_config_path,
+        train_result=train_result,
+        predict_result_train=predict_result_train,
+        predict_result_validation=predict_result_validation,
+    )
+
     print(json.dumps(result, indent=2))
     return result
 
@@ -1464,19 +1565,30 @@ def run_fullpass_experiment(
     seed: int = 42,
     device: Optional[str] = None,
 ) -> Dict[str, str]:
-    config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_fullpass.yaml").resolve()
-    validation_config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_validation_fullpass.yaml").resolve()
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "xlzd"
+        / "settings_fullpass.yaml"
+    ).resolve()
+
+    validation_config_path = (
+        Path(__file__).resolve().parents[1]
+        / "xlzd"
+        / "settings_validation_fullpass.yaml"
+    ).resolve()
 
     runtime = load_runtime_config(config_path, seed=seed)
     validation_runtime = load_runtime_config(validation_config_path, seed=seed)
 
     train_result = train_cnp(runtime, device=device)
+
     predict_result_train = predict_cnp(
         runtime,
         model_path=train_result.model_path,
         chunk_size=20000,
         device=device,
     )
+
     predict_result_validation = predict_cnp(
         validation_runtime,
         model_path=train_result.model_path,
@@ -1484,20 +1596,14 @@ def run_fullpass_experiment(
         device=device,
     )
 
-    result = {
-        "config_path": str(config_path),
-        "validation_config_path": str(validation_config_path),
-        "model_path": str(train_result.model_path),
-        "history_csv": str(train_result.history_csv),
-        "history_plot": str(train_result.history_plot),
-        "sample_plot": str(train_result.sample_plot),
-        "train_csv": str(predict_result_train.csv_path),
-        "train_heatmap": str(predict_result_train.heatmap_path),
-        "train_error_heatmap": str(predict_result_train.error_heatmap_path),
-        "validation_csv": str(predict_result_validation.csv_path),
-        "validation_heatmap": str(predict_result_validation.heatmap_path),
-        "validation_error_heatmap": str(predict_result_validation.error_heatmap_path),
-    }
+    result = _experiment_result_dict(
+        config_path=config_path,
+        validation_config_path=validation_config_path,
+        train_result=train_result,
+        predict_result_train=predict_result_train,
+        predict_result_validation=predict_result_validation,
+    )
+
     print(json.dumps(result, indent=2))
     return result
 
@@ -1507,19 +1613,30 @@ def run_fixed_context_experiment(
     seed: int = 42,
     device: Optional[str] = None,
 ) -> Dict[str, str]:
-    config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_fixedcontext.yaml").resolve()
-    validation_config_path = (Path(__file__).resolve().parents[1] / "xlzd" / "settings_validation_fixedcontext.yaml").resolve()
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "xlzd"
+        / "settings_fixedcontext.yaml"
+    ).resolve()
+
+    validation_config_path = (
+        Path(__file__).resolve().parents[1]
+        / "xlzd"
+        / "settings_validation_fixedcontext.yaml"
+    ).resolve()
 
     runtime = load_runtime_config(config_path, seed=seed)
     validation_runtime = load_runtime_config(validation_config_path, seed=seed)
 
     train_result = train_cnp(runtime, device=device)
+
     predict_result_train = predict_cnp(
         runtime,
         model_path=train_result.model_path,
         chunk_size=20000,
         device=device,
     )
+
     predict_result_validation = predict_cnp(
         validation_runtime,
         model_path=train_result.model_path,
@@ -1527,20 +1644,14 @@ def run_fixed_context_experiment(
         device=device,
     )
 
-    result = {
-        "config_path": str(config_path),
-        "validation_config_path": str(validation_config_path),
-        "model_path": str(train_result.model_path),
-        "history_csv": str(train_result.history_csv),
-        "history_plot": str(train_result.history_plot),
-        "sample_plot": str(train_result.sample_plot),
-        "train_csv": str(predict_result_train.csv_path),
-        "train_heatmap": str(predict_result_train.heatmap_path),
-        "train_error_heatmap": str(predict_result_train.error_heatmap_path),
-        "validation_csv": str(predict_result_validation.csv_path),
-        "validation_heatmap": str(predict_result_validation.heatmap_path),
-        "validation_error_heatmap": str(predict_result_validation.error_heatmap_path),
-    }
+    result = _experiment_result_dict(
+        config_path=config_path,
+        validation_config_path=validation_config_path,
+        train_result=train_result,
+        predict_result_train=predict_result_train,
+        predict_result_validation=predict_result_validation,
+    )
+
     print(json.dumps(result, indent=2))
     return result
 
@@ -1676,11 +1787,13 @@ def main() -> None:
             chunk_size=args.chunk_size,
             device=args.device,
         )
+
         print(json.dumps({
-            "csv_path": str(result.csv_path),
-            "heatmap_path": str(result.heatmap_path),
-            "error_heatmap_path": str(result.error_heatmap_path),
+            "all_shell_csv": str(result.all_path),
+            "best_shell_csv": str(result.best_path),
+            "mfgp_csv": str(result.mfgp_path),
         }, indent=2))
+
         return
 
     if args.cmd == "full":
@@ -1696,6 +1809,7 @@ def main() -> None:
             show_monitor_plots=args.show_monitor_plots,
             device=args.device,
         )
+
         predict_result = predict_cnp(
             runtime,
             model_path=train_result.model_path,
@@ -1705,19 +1819,18 @@ def main() -> None:
             chunk_size=args.chunk_size,
             device=args.device,
         )
+
         print(json.dumps({
             "model_path": str(train_result.model_path),
             "history_csv": str(train_result.history_csv),
             "history_plot": str(train_result.history_plot),
             "sample_plot": str(train_result.sample_plot),
-            "csv_path": str(predict_result.csv_path),
-            "heatmap_path": str(predict_result.heatmap_path),
-            "error_heatmap_path": str(predict_result.error_heatmap_path),
+
+            "all_shell_csv": str(predict_result.all_path),
+            "best_shell_csv": str(predict_result.best_path),
+            "mfgp_csv": str(predict_result.mfgp_path),
         }, indent=2))
 
 
 if __name__ == "__main__":
-    run_minibatch_experiment()
-    # run_fixed_context_experiment()
-    # run_fullpass_experiment()
-    # main()
+    main()

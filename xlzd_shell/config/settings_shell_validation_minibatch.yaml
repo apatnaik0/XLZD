@@ -6,23 +6,14 @@ cnp_settings:
   context_is_subset: true
   batch_size_train: 12000
   files_per_batch_train: 32
-  batch_size_predict:
-  - 20000
-  - 120000
-  files_per_batch_predict: 1
   number_of_walkers: 1
   config_wise: false
-  use_data_augmentation: false
-  use_beta:
-  - 0.1
-  - 0.1
-  signal_to_background_ratio: ''
   ratio_testing_vs_training: 1/10
   plot_after: 5000
 simulation_settings:
   simulation_type: shell
-  R_max: 1500.0
-  Z_max: 2000.0
+  R_max: 1490.0
+  Z_max: 1983.0
   n_shells: 100
   scale_power: 0.3333333333333333
   theta_headers:
@@ -32,23 +23,7 @@ simulation_settings:
   - s_r
   - s_z_from_center
   target_headers:
-  - inside_shell
-  target_range:
-  - 0
-  - 1
-  signal_condition:
-  - inside_shell==1
-  weights_labels:
-  - weights
-  theta_min:
-  - 0.0
-  - 0.0
-  theta_max:
-  - 1500.0
-  - 2000.0
-  theta_fixed:
-  - 750.0
-  - 1000.0
+  - target_shell
   lf_cost: 1
   hf_cost: 10
   negative_shells: 4
@@ -61,7 +36,6 @@ path_settings:
   - 0
   fidelity:
   - 1
-  path_to_files_validation: ../../data/out/cnp/cnp_xlzd_shell_v1_minibatch_output_validation_15epochs.csv
   path_out_cnp: ../../data/out/cnp
   path_out_mfgp: ../../data/out/mfgp
   path_out_pce: ../../data/out/pce
