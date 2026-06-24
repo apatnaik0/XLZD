@@ -801,8 +801,8 @@ def _plot_train_val_shell_probability_snapshot(
 def _plot_training_history(df: pd.DataFrame, out_path: Path) -> None:
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
 
-    ax.plot(df["step"], df["train_ce"], label="train CE")
-    ax.plot(df["step"], df["val_ce"], label="val CE")
+    ax.plot(df["step"], df["train_loss"], label="train CE")
+    ax.plot(df["step"], df["val_loss"], label="val CE")
     ax.set_xlabel("step")
     ax.set_ylabel("Cross entropy")
     ax.set_title("CNP categorical training history")
@@ -838,7 +838,7 @@ def _plot_sample_shell_predictions(
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
-
+    
 def train_cnp(
     runtime: CNPRuntimeConfig,
     steps_per_epoch: Optional[int] = None,
@@ -929,8 +929,8 @@ def train_cnp(
             leave=True,
         )
 
-        running_train_ce: list[float] = []
-        running_val_ce: list[float] = []
+        running_train_loss: list[float] = []
+        running_val_loss: list[float] = []
         running_train_acc: list[float] = []
         running_val_acc: list[float] = []
         running_train_mae: list[float] = []
@@ -950,10 +950,10 @@ def train_cnp(
                 context_mode=runtime.context_mode,
             )
             logits, _sigma = model(cx, cy, tx)
-            train_ce = criterion(logits, ty)
+            train_loss = criterion(logits, ty)
 
             optimizer.zero_grad()
-            train_ce.backward()
+            train_loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
@@ -977,7 +977,7 @@ def train_cnp(
                 )
             
                 vlogits, _vsigma = model(vcx, vcy, vtx)
-                val_ce = criterion(vlogits, vty)
+                val_loss = criterion(vlogits, vty)
             
                 pred_shell = torch.argmax(logits, dim=-1)
                 val_pred_shell = torch.argmax(vlogits, dim=-1)
@@ -992,8 +992,8 @@ def train_cnp(
                 {
                     "epoch": float(epoch),
                     "step": float(global_step),
-                    "train_ce": float(train_ce.item()),
-                    "val_ce": float(val_ce.item()),
+                    "train_loss": float(train_loss.item()),
+                    "val_loss": float(val_loss.item()),
                     "train_acc": float(train_acc.item()),
                     "val_acc": float(val_acc.item()),
                     "train_mae_shell": float(train_mae.item()),
@@ -1002,8 +1002,8 @@ def train_cnp(
             )
 
             # Log data for epoch progress bar
-            running_train_ce.append(float(train_ce.item()))
-            running_val_ce.append(float(val_ce.item()))
+            running_train_loss.append(float(train_loss.item()))
+            running_val_loss.append(float(val_loss.item()))
             running_train_acc.append(float(train_acc.item()))
             running_val_acc.append(float(val_acc.item()))
             running_train_mae.append(float(train_mae.item()))
@@ -1011,8 +1011,8 @@ def train_cnp(
             
             # Keep only recent values so the displayed average reacts during training.
             window = 100
-            running_train_ce = running_train_ce[-window:]
-            running_val_ce = running_val_ce[-window:]
+            running_train_loss = running_train_loss[-window:]
+            running_val_loss = running_val_loss[-window:]
             running_train_acc = running_train_acc[-window:]
             running_val_acc = running_val_acc[-window:]
             running_train_mae = running_train_mae[-window:]
@@ -1020,8 +1020,8 @@ def train_cnp(
             
             epoch_pbar.set_postfix(
                 {
-                    "train_ce": f"{np.mean(running_train_ce):.4f}",
-                    "val_ce": f"{np.mean(running_val_ce):.4f}",
+                    "train_loss": f"{np.mean(running_train_loss):.4f}",
+                    "val_loss": f"{np.mean(running_val_loss):.4f}",
                     "train_acc": f"{np.mean(running_train_acc):.3f}",
                     "val_acc": f"{np.mean(running_val_acc):.3f}",
                     "train_mae": f"{np.mean(running_train_mae):.2f}",
@@ -1047,8 +1047,8 @@ def train_cnp(
                     val_true_shell=vty,
                     out_path=latest_plot,
                     step=global_step,
-                    train_loss=float(train_ce.item()),
-                    val_loss=float(val_ce.item()),
+                    train_loss=float(train_loss.item()),
+                    val_loss=float(val_loss.item()),
                     n_shells=runtime.n_shells,
                 )
 
@@ -1081,7 +1081,7 @@ def train_cnp(
             "training_mode": training_mode,
             "context_mode": runtime.context_mode,
             "version": runtime.version,
-            "loss": "weighted_categorical_cross_entropy",
+            "loss": "weighted_conditional_cross_entropy",
         }, model_path,
     )
 
