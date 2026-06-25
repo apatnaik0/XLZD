@@ -27,66 +27,32 @@ import numpy as np
 import pandas as pd
 import h5py
 
+def find_repo_root(start: Path | None = None) -> Path:
+    start = (start or Path.cwd()).resolve()
+    for candidate in [start, *start.parents]:
+        if (candidate / "PROJECT_EXPERIMENT_GUIDE.md").exists() and (candidate / "README.md").exists():
+            return candidate
+    raise RuntimeError("Could not find the XLZD repo root from the current working directory.")
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+
+REPO_ROOT = find_repo_root()
 SRC_ROOT = REPO_ROOT / "src"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from xlzd_resum.config import (  # noqa: E402
-    DEFAULT_FILE_STEMS,
-    FileLoadConfig,
-    OutputConfig,
-    SamplingConfig,
-    SplitConfig,
-)
-from xlzd_resum.dataset import (  # noqa: E402
-    split_into_disjoint_pools,
-    split_pool_into_blocks,
-)
-from xlzd_resum.io_utils import load_event_collection, save_dataframe  # noqa: E402
-from xlzd_resum.theta import Z_FROM_CENTER_COLUMN, add_centered_z_coordinate  # noqa: E402
+from common.config import FileLoadConfig, DEFAULT_FILE_STEMS, SplitConfig, SamplingConfig, OutputConfig, ShellConfig, ShellPipelineConfig
+from common.dataset import split_into_disjoint_pools, split_pool_into_blocks
+from common.io_utils import load_event_collection, save_dataframe
+from common.theta import Z_FROM_CENTER_COLUMN, add_centered_z_coordinate 
+from common.geometry import build_shell_table, update_detector_maximums, infer_centered_z_coordinate
+from common.blocks import build_shell_event_block
+from common.h5_utils import write_shell_table_group
+from common.pipeline_utils import log_stage, finish_stage
 
 
 TARGET_COLUMN = "target_shell"
-
-
-@dataclass(slots=True)
-class ShellConfig:
-    R_max: float | None = None
-    Z_max: float | None = None
-    n_shells: int = 100
-    min_candidate_events: int = 25
-    z_center: float | None = None
-    scale_power: float = 1.0/3.0
-
-    def validate(self) -> None:
-        if self.R_max is not None and self.R_max <=0:
-            raise ValueError("R_max must be positive")
-        if self.Z_max is not None and self.Z_max <=0:
-            raise ValueError("Z_max must be positive")
-        if self.n_shells <= 0:
-            raise ValueError("n_shells must be positive.")
-        if self.min_candidate_events <= 0:
-            raise ValueError("min_candidate_events must be positive.")
-
-
-@dataclass(slots=True)
-class ShellPipelineConfig:
-    file_load: FileLoadConfig
-    split: SplitConfig
-    sampling: SamplingConfig
-    shell: ShellConfig
-    output: OutputConfig
-
-    def validate(self) -> None:
-        self.file_load.validate()
-        self.split.validate()
-        self.sampling.validate()
-        self.shell.validate()
-        self.output.validate()
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,171 +120,6 @@ def build_config(args: argparse.Namespace) -> ShellPipelineConfig:
     return config
 
 
-def log_stage(message: str) -> float:
-    print(f"\n[{time.strftime('%H:%M:%S')}] {message}", flush=True)
-    return time.perf_counter()
-
-
-def finish_stage(stage_start: float, message: str) -> None:
-    elapsed = time.perf_counter() - stage_start
-    print(f"[done in {elapsed:.2f}s] {message}", flush=True)
-
-def update_detector_maximums(
-    df: pd.DataFrame,
-    shell_cfg: ShellConfig,
-    z_center: float,
-) -> None:
-    # Find Z and R Maximum
-    if "r" not in df.columns or "z" not in df.columns:
-        raise ValueError("Dataframe must contain 'z' and 'r' to infer detector maximums")
-    if shell_cfg.R_max is None:
-        shell_cfg.R_max = df['r'].max()
-    if shell_cfg.Z_max is None:
-        shell_cfg.Z_max = np.abs(df['z'] - z_center).max()
-    
-def infer_centered_z_coordinate(df: pd.DataFrame, shell_cfg: ShellConfig) -> float:
-    if "z" not in df.columns:
-        raise ValueError("Dataframe must contain 'z' to infer centered coordinates.")
-    if shell_cfg.z_center is not None:
-        return float(shell_cfg.z_center)
-    else:
-        z_center = 0.5 * (df["z"].min() + df["z"].max())
-        shell_cfg.z_center = z_center
-        return z_center
-    
-
-def shell_boundaries(shell_cfg: ShellConfig) -> pd.DataFrame:
-    idx = np.arange(0, shell_cfg.n_shells + 1, dtype=float)
-    frac = idx / float(shell_cfg.n_shells)
-    scale = frac ** shell_cfg.scale_power
-    r = shell_cfg.R_max * scale
-    z = shell_cfg.Z_max * scale
-    return pd.DataFrame(
-        {
-            "shell_level": idx.astype(int),
-            "R_boundary": r.astype(float),
-            "Z_boundary": z.astype(float),
-        }
-    )
-
-def inside_shell(
-    df: pd.DataFrame,
-    *,
-    R_inner: float,
-    Z_inner: float,
-    R_outer: float,
-    Z_outer: float,
-) -> np.ndarray:
-    required = {"r", Z_FROM_CENTER_COLUMN}
-    if not required.issubset(df.columns):
-        raise ValueError(f"Block dataframe must contain columns {required}.")
-
-    r = df["r"].to_numpy(dtype=float)
-    z = df[Z_FROM_CENTER_COLUMN].to_numpy(dtype=float)
-
-    inside_outer = (r <= R_outer) & (z <= Z_outer)
-    inside_inner = (r <= R_inner) & (z <= Z_inner)
-    return inside_outer & ~inside_inner
-
-
-def build_shell_table(df_for_support: pd.DataFrame, shell_cfg: ShellConfig) -> pd.DataFrame:
-    boundaries = shell_boundaries(shell_cfg)
-    support_rows: list[dict[str, float | int]] = []
-    shell_volume = 2.0 * np.pi * shell_cfg.Z_max * (shell_cfg.R_max**2) / float(shell_cfg.n_shells)
-
-    for i in range(1, shell_cfg.n_shells + 1):
-        prev = boundaries.iloc[i - 1]
-        curr = boundaries.iloc[i]
-        mask = inside_shell(
-            df_for_support,
-            R_inner=float(prev["R_boundary"]),
-            Z_inner=float(prev["Z_boundary"]),
-            R_outer=float(curr["R_boundary"]),
-            Z_outer=float(curr["Z_boundary"]),
-        )
-        support_rows.append(
-            {
-                "shell_index": int(i),
-                "class_index": int(i-1),
-                "R_inner": float(prev["R_boundary"]),
-                "Z_inner": float(prev["Z_boundary"]),
-                "R_shell": float(curr["R_boundary"]),
-                "Z_shell": float(curr["Z_boundary"]),
-                "candidate_events": int(mask.sum()),
-                "shell_volume": float(shell_volume),
-            }
-        )
-
-    out = pd.DataFrame(support_rows)
-    low_support = out[out["candidate_events"] < shell_cfg.min_candidate_events]
-    if not low_support.empty:
-        print("[warn] Some shell classes have low support, but they are kept for categorical CE because class IDs must remain fixed")
-
-    return out.sort_values(["shell_index"]).reset_index(drop=True)
-
-def positive_shells_for_block(
-    block_df: pd.DataFrame,
-    shell_table_df: pd.DataFrame,
-) -> pd.Series:
-    """
-    Return one positive shell index per event
-    
-    The returned shell is one-indexed
-    Events outside the detector bounds are labelled NaN
-    """
-    positive_shell = pd.Series(np.nan, index=block_df.index, dtype="float")
-    
-    for row in shell_table_df.itertuples(index=False):
-        mask = inside_shell(
-            block_df,
-            R_inner=float(row.R_inner),
-            Z_inner=float(row.Z_inner),
-            R_outer=float(row.R_shell),
-            Z_outer=float(row.Z_shell),
-        )
-        positive_shell.loc[mask] = int(row.shell_index)
-
-    return positive_shell
-
-def build_event_class_block(
-    *,
-    block_df: pd.DataFrame,
-    shell_table_df: pd.DataFrame,
-    phi_headers: Sequence[str],
-) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """
-    Build one categorical training row per event
-
-    Returns:
-        phi:           [N_valid_events, phi_dim]
-        target_shell:  [N_valid_events] zero-indexed class labels
-        meta:          event_index and readable one-indexed shell index
-    """
-    positive_shell_one_based = positive_shells_for_block(
-        block_df=block_df,
-        shell_table_df=shell_table_df
-    )
-
-    valid_mask=positive_shell_one_based.notna()
-    if not valid_mask.any():
-        raise RuntimeError("This block has no events with a valid shell")
-    valid_events = block_df.loc[valid_mask].copy()
-
-    shell_one_based = (
-        positive_shell_one_based.loc[valid_mask].astype(np.int64).to_numpy()
-    )
-
-    # Loss expects classes 0...n_classes-1
-    target_shell_zero_based = shell_one_based - 1
-    phi = valid_events[list(phi_headers)].to_numpy(dtype=np.float32)
-
-    meta = {
-        "event_index": valid_events.index.to_numpy(dtype=np.int64),
-        "shell_index": shell_one_based.astype(np.int32),
-    }
-
-    return phi, target_shell_zero_based.astype(np.int64), meta
-
 def write_h5_class_block(
     *,
     output_path: Path,
@@ -354,9 +155,7 @@ def write_h5_class_block(
         f.create_dataset("phi_labels", data=np.asarray(phi_headers, dtype="S"))
         f.create_dataset("target_headers", data=np.asarray([TARGET_COLUMN], dtype="S"))
 
-        shell_group = f.create_group("shell_table")
-        for col in ["shell_index", "class_index", "R_inner", "Z_inner", "R_shell", "Z_shell", "candidate_events", "shell_volume"]:
-            shell_group.create_dataset(col, data=shell_table_df[col].to_numpy(), compression="gzip", compression_opts=4)
+        write_shell_table_group(f, shell_table_df)
 
         meta_group = f.create_group("meta")
         for key, value in meta.items():
@@ -386,15 +185,23 @@ def write_h5_all_class_blocks(
 
     for block_index, block_df in enumerate(blocks):
         try:
-            phi, target_shell, meta = build_event_class_block(
+            shell_block = build_shell_event_block(
                 block_df=block_df,
                 shell_table_df=shell_table_df,
-                phi_headers=phi_headers,
+                feature_columns=phi_headers,
+                keep_event_data=False,
             )
         except RuntimeError as e:
             print(f"[warn] skipping block {block_index}: {e}")
             continue
 
+        phi = shell_block.features
+        target_shell = shell_block.truth_shell
+        meta = {
+            "event_index": shell_block.event_index,
+            "shell_index": shell_block.human_shell
+        }
+        
         output_path = output_dir / f"{fidelity}_block{block_index:04d}_event_classes.h5"
 
         write_h5_class_block(
