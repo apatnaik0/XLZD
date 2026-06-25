@@ -1,0 +1,39 @@
+{
+  "file_load": {
+    "input_dir": "data",
+    "file_stems": [
+      "CathodeGrid_2447keVgamma_ROI1sigma_SScut_vetoapplied",
+      "FieldCage_2447keVgamma_ROI1sigma_SScut_vetoapplied",
+      "GXe_2447keVgamma_ROI1sigma_SScut_vetoapplied",
+      "ICV_2447keVgamma_ROI1sigma_SScut_vetoapplied",
+      "OCV_2447keVgamma_ROI1sigma_SScut_vetoapplied",
+      "TPCPMTTBottom_2447keVgamma_ROI1sigma_SScut_vetoapplied",
+      "TPCPMTTop_2447keVgamma_ROI1sigma_SScut_vetoapplied"
+    ],
+    "max_rows_per_file": null
+  },
+  "split": {
+    "lf_pool_fraction": 0.2,
+    "hf_pool_fraction": 0.4,
+    "random_seed": 42,
+    "stratify_by_component": false
+  },
+  "sampling": {
+    "hf_block_size": 100000,
+    "lf_block_size": 20000,
+    "validation_block_size": null,
+    "progress": true
+  },
+  "shell": {
+    "R_max": 1490.0,
+    "Z_max": 1983.0,
+    "n_shells": 100,
+    "min_candidate_events": 1,
+    "z_center": 1982.48,
+    "scale_power": 0.3333333333333333
+  },
+  "output": {
+    "output_dir": "shell_outputs",
+    "output_format": "csv"
+  }
+}
