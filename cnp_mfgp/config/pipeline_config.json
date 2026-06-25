@@ -25,15 +25,15 @@
     "progress": true
   },
   "shell": {
-    "R_max": 1490.0,
-    "Z_max": 1983.0,
+    "R_max": 1500.0,
+    "Z_max": 2000.0,
     "n_shells": 100,
-    "min_candidate_events": 1,
+    "min_candidate_events": 5,
     "z_center": 1982.48,
-    "scale_power": 0.3333333333333333
+    "scale_power": 0.3333333
   },
   "output": {
-    "output_dir": "shell_outputs",
+    "output_dir": "outputs/cnp_mfgp",
     "output_format": "csv"
   }
 }

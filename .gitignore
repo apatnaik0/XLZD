@@ -15,10 +15,10 @@ archive/outputs_smoke/**
 !archive/outputs_smoke/**/
 !archive/outputs_smoke/**/.gitkeep
 
-shell_outputs/**
-!shell_outputs/.gitkeep
-!shell_outputs/**/
-!shell_outputs/**/.gitkeep
+outputs/**
+!outputs/.gitkeep
+!outputs/**/
+!outputs/**/.gitkeep
 
 # Depth penetration HTML artifacts
 archive/depth_penetration_experiments/artifacts/**
