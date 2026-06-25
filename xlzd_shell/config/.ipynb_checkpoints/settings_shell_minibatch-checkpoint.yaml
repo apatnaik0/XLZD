@@ -2,10 +2,10 @@ cnp_settings:
   training_mode: minibatch
   training_epochs: 15
   steps_per_epoch: 5000
-  context_ratio: 0.3333333
+  context_ratio: 0.05
   context_is_subset: true
-  batch_size_train: 12000
-  files_per_batch_train: 32
+  batch_size_train: 8192
+  files_per_batch_train: 16
   batch_size_predict:
   - 20000
   - 120000
@@ -39,6 +39,7 @@ simulation_settings:
   - weights
   lf_cost: 1
   hf_cost: 10
+  negative_shells: 4
 path_settings:
   version: xlzd_shell_v1_minibatch
   path_to_files_train: ../../shell_outputs/training/lf

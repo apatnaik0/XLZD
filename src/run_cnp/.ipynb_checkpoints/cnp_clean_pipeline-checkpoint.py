@@ -565,7 +565,7 @@ def split_context_target_class(
 def compute_shell_class_weights(
     pool: H5EventPool,
     n_shells: int,
-    beta: float | None = 0.999,
+    beta: float = 0.5,
     max_weight: float | None = 20.0,
 ) -> torch.Tensor:
     counts = np.zeros(n_shells, dtype=np.float64)
@@ -581,11 +581,7 @@ def compute_shell_class_weights(
 
     safe_counts = np.maximum(counts, 1.0)
 
-    if beta is None:
-        weights = safe_counts.sum() / (n_shells * safe_counts)
-    else:
-        effective_num = 1.0 - np.power(beta, safe_counts)
-        weights = (1.0 - beta) / effective_num
+    weights = safe_counts ** (-beta)
 
     present = counts > 0
 
@@ -871,7 +867,7 @@ def train_cnp(
     dev = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
     model.to(dev)
 
-    class_weights = compute_shell_class_weights(pool, n_shells=runtime.n_shells, beta=0.999, max_weight=20.0).to(dev)
+    class_weights = compute_shell_class_weights(pool, n_shells=runtime.n_shells, beta=0.5, max_weight=20.0).to(dev)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
