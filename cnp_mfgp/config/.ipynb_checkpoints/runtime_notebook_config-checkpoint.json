@@ -16,8 +16,11 @@
     "progress": true
   },
   "shell": {
+    "R_max": null,
+    "Z_max": null,
     "n_shells": 100,
     "min_candidate_events": 1,
+    "z_center": null,
     "scale_power": 0.3333333333333333
   },
   "output": {
