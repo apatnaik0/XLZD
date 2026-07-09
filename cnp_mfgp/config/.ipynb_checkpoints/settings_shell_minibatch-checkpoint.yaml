@@ -8,7 +8,6 @@ cnp_settings:
   files_per_batch_train: 16
   ratio_testing_vs_training: 1/10
   plot_after: 5000
-  
 simulation_settings:
   n_shells: 100
   theta_headers:
@@ -19,18 +18,18 @@ simulation_settings:
   - s_z_from_center
   target_headers:
   - target_shell
-  
+  scale_power: 0.3333333333333333
 path_settings:
   version: xlzd_shell_minibatch
-  path_to_files_train: ../../outputs/cnp_mfgp/training/lf
+  path_to_files_train: ../outputs/datasets/training/lf
   path_to_files_predict:
-  - ../../outputs/cnp_mfgp/training/lf
-  - ../../outputs/cnp_mfgp/training/hf
+  - ../outputs/datasets/training/lf
+  - ../outputs/datasets/training/hf
   iteration:
   - 0
   - 0
   fidelity:
   - 0
   - 1
-  path_out_cnp: ../../data/out/cnp
-
+  path_out_cnp: ../outputs/cnp
+  path_out_mfgp: ../outputs/mfgp

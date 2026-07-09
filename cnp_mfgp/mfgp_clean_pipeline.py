@@ -58,7 +58,7 @@ def _default_config_path() -> Path:
         c = c.resolve()
         if c.exists():
             return c
-    return (here / "../xlzd/settings.yaml").resolve()
+    return (here / "config" / "settings_shell_minibatch.yaml").resolve()
 
 
 def _resolve_path(path_value: str | Path, base: Path) -> Path:

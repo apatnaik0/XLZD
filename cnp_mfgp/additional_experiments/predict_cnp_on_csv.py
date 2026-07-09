@@ -21,7 +21,7 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src"
-RUN_CNP_ROOT = SRC_ROOT / "run_cnp"
+RUN_CNP_ROOT = SRC_ROOT / "cnp_mfgp"
 for path in [REPO_ROOT, SRC_ROOT, RUN_CNP_ROOT]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
@@ -29,8 +29,8 @@ for path in [REPO_ROOT, SRC_ROOT, RUN_CNP_ROOT]:
 from cnp_clean_pipeline import H5EventPool, load_model_checkpoint, load_runtime_config, set_seed  # noqa: E402
 
 
-DEFAULT_CONFIG = Path("xlzd_equal_volume_shell_theta/settings_equal_volume_shell_minibatch.yaml")
-DEFAULT_PIPELINE_CONFIG = Path("xlzd_equal_volume_shell_theta/config/pipeline_config.json")
+DEFAULT_CONFIG = Path("cnp_mfgp/config/settings_shell_minibatch.yaml")
+DEFAULT_PIPELINE_CONFIG = Path("cnp_mfgp/config/pipeline_config.yaml")
 DEFAULT_Z_CENTER = 1982.48
 
 

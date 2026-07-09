@@ -17,21 +17,13 @@ def find_repo_root(start: Path | None = None) -> Path:
 
 REPO_ROOT = find_repo_root()
 os.chdir(REPO_ROOT)
+CNP_MFGP_ROOT = REPO_ROOT / "cnp_mfgp"
+if str(CNP_MFGP_ROOT) not in sys.path:
+    sys.path.insert(0, str(CNP_MFGP_ROOT))
 
-if str(REPO_ROOT / "src" / "run_cnp") not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT / "src" / "run_cnp"))
-
-from cnp_clean_pipeline import (
-    CNPRuntimeConfig,
-    PredictResult,
-    predict_cnp
-)
-from prepare_shell_data import (
-    ShellConfig,
-    shell_boundaries,
-    write_h5_single_block,
-    TARGET_COLUMN,
-)
+from cnp_clean_pipeline import CNPRuntimeConfig, PredictResult, predict_cnp
+from prepare_cnp_mfgp_data import ShellConfig, TARGET_COLUMN
+from common.geometry import shell_boundaries
 
 ###====================================###
 

@@ -15,10 +15,10 @@ archive/outputs_smoke/**
 !archive/outputs_smoke/**/
 !archive/outputs_smoke/**/.gitkeep
 
-outputs/**
-!outputs/.gitkeep
-!outputs/**/
-!outputs/**/.gitkeep
+cnp_mfgp/outputs/**
+!cnp_mfgp/outputs/.gitkeep
+!cnp_mfgp/outputs/**/
+!cnp_mfgp/outputs/**/.gitkeep
 
 # Depth penetration HTML artifacts
 archive/depth_penetration_experiments/artifacts/**

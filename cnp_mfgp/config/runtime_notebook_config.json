@@ -21,7 +21,7 @@
     "scale_power": 0.3333333333333333
   },
   "output": {
-    "output_dir": "outputs/cnp_mfgp",
+    "output_dir": "cnp_mfgp/outputs/datasets",
     "output_format": "csv"
   }
 }

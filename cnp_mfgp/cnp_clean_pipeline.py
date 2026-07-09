@@ -1785,7 +1785,7 @@ def run_fixed_context_experiment(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Clean CNP train/predict pipeline (no resum dependency)")
-    default_config = Path(__file__).resolve().parents[1] / "xlzd" / "settings.yaml"
+    default_config = Path(__file__).resolve().parents[1] / "config" / "settings_shell_minibatch.yaml"
     p.add_argument("--config", type=Path, default=default_config, help="Path to settings YAML")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--device", type=str, default=None, help="Torch device (e.g., cpu, cuda)")
