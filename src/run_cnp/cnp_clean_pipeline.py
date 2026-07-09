@@ -1182,6 +1182,7 @@ def predict_cnp(
     output_epochs: Optional[int] = None,
     chunk_size: int = 20000,
     device: Optional[str] = None,
+    all_shells: bool = False,
 ) -> PredictResult:
     runtime.out_dir.mkdir(parents=True, exist_ok=True)
     set_seed(runtime.seed)
@@ -1265,6 +1266,7 @@ def predict_cnp(
 
     print("\n" + "=" * 80)
     print("Starting CNP prediction")
+    print(f"Save all-shell CSV: {all_shells}")
     print("=" * 80)
 
     for i, pred_dir in enumerate(runtime.predict_dirs):
@@ -1384,47 +1386,59 @@ def predict_cnp(
                     probs = prob_t.cpu().numpy()  # (N_events_chunk, n_shells)
                     stds = std_t.cpu().numpy()    # (N_events_chunk, n_shells)
 
-                    repeated_event_index = np.repeat(event_index_chunk, repeats=n_shells)
-                    repeated_original_event_id = np.repeat(
-                        original_event_id_chunk,
-                        repeats=n_shells,
-                    )
-                    repeated_source_file = np.repeat(source_file_chunk, repeats=n_shells)
-                    repeated_source_fidelity = np.repeat(
-                        source_fidelity_chunk,
-                        repeats=n_shells,
-                    )
                     tiled_shell_index = np.tile(shell_indices, reps=n_events_chunk)
                     repeated_true_shell = np.repeat(true_shell_one_chunk, repeats=n_shells)
+                    flat_y_cnp = probs.reshape(-1)
+                    flat_y_cnp_err = stds.reshape(-1)
+                    flat_y_raw = (tiled_shell_index == repeated_true_shell).astype(np.float32)
 
-                    out = pd.DataFrame(
-                        {
-                            "iteration": float(iteration),
-                            "fidelity": float(fidelity),
-                            "source_file": repeated_source_file,
-                            "source_fidelity": repeated_source_fidelity,
-                            "event_index": repeated_event_index,
-                            "original_event_id": repeated_original_event_id,
-                            "shell_index": tiled_shell_index,
-                            "true_shell_index": repeated_true_shell,
-                            "y_cnp": probs.reshape(-1),
-                            "y_cnp_err": stds.reshape(-1),
-                        }
-                    )
-
-                    for theta_col, theta_name in enumerate(runtime.theta_headers):
-                        out[theta_name] = np.repeat(
-                            theta_chunk[:, theta_col],
+                    if all_shells:
+                        repeated_event_index = np.repeat(event_index_chunk, repeats=n_shells)
+                        repeated_original_event_id = np.repeat(
+                            original_event_id_chunk,
+                            repeats=n_shells,
+                        )
+                        repeated_source_file = np.repeat(source_file_chunk, repeats=n_shells)
+                        repeated_source_fidelity = np.repeat(
+                            source_fidelity_chunk,
                             repeats=n_shells,
                         )
 
-                    out["y_raw"] = (
-                        out["shell_index"].to_numpy(dtype=np.int32)
-                        == out["true_shell_index"].to_numpy(dtype=np.int32)
-                    ).astype(float)
+                        out = pd.DataFrame(
+                            {
+                                "iteration": float(iteration),
+                                "fidelity": float(fidelity),
+                                "source_file": repeated_source_file,
+                                "source_fidelity": repeated_source_fidelity,
+                                "event_index": repeated_event_index,
+                                "original_event_id": repeated_original_event_id,
+                                "shell_index": tiled_shell_index,
+                                "true_shell_index": repeated_true_shell,
+                                "y_cnp": flat_y_cnp,
+                                "y_cnp_err": flat_y_cnp_err,
+                            }
+                        )
 
-                    # Already normalized by softmax.
-                    out["p_shell"] = out["y_cnp"]
+                        for theta_col, theta_name in enumerate(runtime.theta_headers):
+                            out[theta_name] = np.repeat(
+                                theta_chunk[:, theta_col],
+                                repeats=n_shells,
+                            )
+
+                        out["y_raw"] = flat_y_raw
+
+                        # Already normalized by softmax.
+                        out["p_shell"] = out["y_cnp"]
+
+                        out.to_csv(
+                            all_shell_csv,
+                            mode="w" if write_all_header else "a",
+                            header=write_all_header,
+                            index=False,
+                        )
+                        write_all_header = False
+
+                        del out
 
                     best_zero = np.argmax(probs, axis=1)
                     best_one = best_zero + 1
@@ -1454,14 +1468,6 @@ def predict_cnp(
                     for theta_col, theta_name in enumerate(runtime.theta_headers):
                         best_chunk[theta_name] = theta_chunk[:, theta_col]
 
-                    out.to_csv(
-                        all_shell_csv,
-                        mode="w" if write_all_header else "a",
-                        header=write_all_header,
-                        index=False,
-                    )
-                    write_all_header = False
-
                     best_chunk.to_csv(
                         best_shell_csv,
                         mode="w" if write_best_header else "a",
@@ -1470,7 +1476,25 @@ def predict_cnp(
                     )
                     write_best_header = False
 
-                    agg_source = out[out["true_shell_index"] >= 0].copy()
+                    # Build the smallest possible frame needed for MFGP aggregation.
+                    # This keeps the MFGP output unchanged, but avoids materializing the
+                    # large diagnostic all-shell DataFrame when all_shells=False.
+                    agg_source = pd.DataFrame(
+                        {
+                            "iteration": float(iteration),
+                            "fidelity": float(fidelity),
+                            "shell_index": tiled_shell_index,
+                            "y_cnp": flat_y_cnp,
+                            "y_cnp_err_sq": np.square(flat_y_cnp_err),
+                            "y_raw": flat_y_raw,
+                        }
+                    )
+
+                    for theta_col, theta_name in enumerate(runtime.theta_headers):
+                        agg_source[theta_name] = np.repeat(
+                            theta_chunk[:, theta_col],
+                            repeats=n_shells,
+                        )
 
                     if not agg_source.empty:
                         agg_chunk = (
@@ -1480,10 +1504,7 @@ def predict_cnp(
                             )
                             .agg(
                                 y_cnp_sum=("y_cnp", "sum"),
-                                y_cnp_err_sq_sum=(
-                                    "y_cnp_err",
-                                    lambda x: float(np.sum(np.square(x))),
-                                ),
+                                y_cnp_err_sq_sum=("y_cnp_err_sq", "sum"),
                                 y_raw_sum=("y_raw", "sum"),
                                 n_samples=("y_cnp", "size"),
                             )
@@ -1493,10 +1514,9 @@ def predict_cnp(
 
                     total_event_count += n_events_chunk
 
-                    del out, best_chunk, probs, stds, target_x
+                    del best_chunk, agg_source, probs, stds, target_x
+                    del tiled_shell_index, repeated_true_shell, flat_y_cnp, flat_y_cnp_err, flat_y_raw
 
-                    if "agg_source" in locals():
-                        del agg_source
                     if "agg_chunk" in locals():
                         del agg_chunk
 
@@ -1569,12 +1589,15 @@ def predict_cnp(
 
     print("\n" + "=" * 80)
     print(f"MFGP CSV:       {mfgp_csv}")
-    print(f"All-shell CSV:  {all_shell_csv}")
+    if all_shells:
+        print(f"All-shell CSV:  {all_shell_csv}")
+    else:
+        print("All-shell CSV:  not saved (all_shells=False)")
     print(f"Best-shell CSV: {best_shell_csv}")
     print("=" * 80)
 
     return PredictResult(
-        all_path=all_shell_csv,
+        all_path=all_shell_csv if all_shells else None,
         best_path=best_shell_csv,
         mfgp_path=mfgp_csv,
     )
