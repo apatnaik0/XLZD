@@ -1,5 +1,14 @@
 # XLZD
 
+Code and experiment workflows for different machine learning models on XLZD event data.
+
+This repository contains:
+
+ - RESuM style CNP/MFGP pipelinen
+   - LF/HF processing pipeline
+   - CNP training and prediction workflows
+   -  
+
 Code and experiment workflows for CNP and MF-GP modeling on XLZD event data.
 
 This repository contains:

@@ -1,0 +1,47 @@
+cnp_settings:
+  training_mode: minibatch
+  training_epochs: 15
+  steps_per_epoch: 5000
+  context_ratio: 0.3333333
+  context_is_subset: True
+  batch_size_train: 12000
+  files_per_batch_train: 32
+  batch_size_predict: [20000, 120000]
+  files_per_batch_predict: 1
+  number_of_walkers: 1
+  config_wise: False
+  use_data_augmentation: False
+  use_beta: [0.1, 0.1]
+  signal_to_background_ratio: ""
+  ratio_testing_vs_training: 1/10
+  plot_after: 5000
+
+simulation_settings:
+  theta_headers: ["R_max", "Z_max"]
+  phi_labels: ["s_r", "s_z_from_center"]
+  target_headers: ["inside_theta"]
+  target_range: [0, 1]
+  signal_condition: ["inside_theta==1"]
+  weights_labels: ["weights"]
+  theta_min: [0.0, 0.0]
+  theta_max: [1500.0, 2000.0]
+  theta_fixed: [750.0, 1000.0]
+  lf_cost: 1
+  hf_cost: 10
+
+path_settings:
+  version: xlzd_v1_minibatch
+
+  path_to_files_train: ../../outputs/training/lf
+
+  path_to_files_predict:
+    - ../../outputs/validation/hf
+
+  iteration: [0]
+  fidelity: [1]
+
+  path_to_files_validation: ../../data/out/cnp/cnp_xlzd_v1_minibatch_output_validation_15epochs.csv
+
+  path_out_cnp: ../../data/out/cnp
+  path_out_mfgp: ../../data/out/mfgp
+  path_out_pce: ../../data/out/pce

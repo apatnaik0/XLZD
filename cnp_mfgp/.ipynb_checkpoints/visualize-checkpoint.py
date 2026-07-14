@@ -18,8 +18,9 @@ def find_repo_root(start: Path | None = None) -> Path:
 
 REPO_ROOT = find_repo_root()
 os.chdir(REPO_ROOT)
-if str(REPO_ROOT / "src" / "run_cnp") not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT / "src" / "run_cnp"))
+CNP_MFGP_ROOT = REPO_ROOT / "cnp_mfgp"
+if str(CNP_MFGP_ROOT) not in sys.path:
+    sys.path.insert(0, str(CNP_MFGP_ROOT))
 from cnp_clean_pipeline import PredictResult
 
 ###====================================###
@@ -276,8 +277,6 @@ def plot_input_shell_occupancy(
     inpath: Path | str | list[str | Path],
     outpath: Path | str,
     scale_power: Optional[float] = 1.0/3.0,
-    Z_max: Optional[float | None] = None,
-    R_max: Optional[float | None] = None,
 ) -> None:
     """
     Takes a file that is an input to training and plots the shell distribution
@@ -290,10 +289,8 @@ def plot_input_shell_occupancy(
     df = load_df_with_rt(csv_files)
 
     # Calculate maximums
-    if Z_max is None:
-        Z_max = np.ceil(df['z'].max()/2)
-    if R_max is None:
-        R_max = np.ceil(df['r'].max())
+    Z_max = np.ceil(df['z'].max()/2)
+    R_max = np.ceil(df['r'].max())
 
     # Set z to measure from center
     df["z"] = np.abs(df['z'] - Z_max)

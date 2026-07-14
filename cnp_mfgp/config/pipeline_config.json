@@ -1,15 +1,6 @@
 {
   "file_load": {
     "input_dir": "data",
-    "file_stems": [
-      "CathodeGrid_2447keVgamma_ROI1sigma_SScut_vetoapplied",
-      "FieldCage_2447keVgamma_ROI1sigma_SScut_vetoapplied",
-      "GXe_2447keVgamma_ROI1sigma_SScut_vetoapplied",
-      "ICV_2447keVgamma_ROI1sigma_SScut_vetoapplied",
-      "OCV_2447keVgamma_ROI1sigma_SScut_vetoapplied",
-      "TPCPMTTBottom_2447keVgamma_ROI1sigma_SScut_vetoapplied",
-      "TPCPMTTop_2447keVgamma_ROI1sigma_SScut_vetoapplied"
-    ],
     "max_rows_per_file": null
   },
   "split": {
@@ -25,15 +16,12 @@
     "progress": true
   },
   "shell": {
-    "R_max": 1500.0,
-    "Z_max": 2000.0,
     "n_shells": 100,
-    "min_candidate_events": 5,
-    "z_center": 1982.48,
-    "scale_power": 0.3333333
+    "min_candidate_events": 1,
+    "scale_power": 0.333333333333
   },
   "output": {
-    "output_dir": "outputs/cnp_mfgp",
+    "output_dir": "cnp_mfgp/outputs/datasets",
     "output_format": "csv"
   }
 }
