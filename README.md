@@ -1,192 +1,165 @@
-# XLZD
+# XLZD Machine-Learning Workflows - Updated July 14th, 2026
 
-Code and experiment workflows for different machine learning models on XLZD event data.
+This repository contains machine-learning workflows for modeling event distributions in proposed XLZD detector geometries.
 
-This repository contains:
+The central research goal is to learn how detector geometry and event-source position affect where energy-deposition events occur inside the detector. The active workflow includes:
 
- - RESuM style CNP/MFGP pipelinen
-   - LF/HF processing pipeline
-   - CNP training and prediction workflows
-   -  
+- a **Conditional Neural Process (CNP)** for event-level shell prediction and a **Multi-Fidelity Gaussian Process (MF-GP)** for learning geometry-level trends from low- and high-fidelity data;
+- shared preprocessing, geometry, HDF5, and dataset utilities;
+- notebooks and experiments used to evaluate alternative model choices.
 
-Code and experiment workflows for CNP and MF-GP modeling on XLZD event data.
+The main active implementation is in [`cnp_mfgp/`](cnp_mfgp/).
 
-This repository contains:
+For the detailed CNP–MFGP workflow, configuration format, commands, outputs, and modeling conventions, see:
 
-- the standard RESuM-style LF/HF preprocessing pipeline
-- CNP training and prediction workflows
-- MF-GP fitting and visualization workflows
-- alternative theta experiments
-- depth-penetration modeling experiments and interactive visualizations
+- [`cnp_mfgp/README.md`](cnp_mfgp/README.md)
 
-For a detailed explanation of the code structure, experiment logic, and why each branch exists, see:
+For the history of the project and the reasoning behind earlier experiment branches, see:
 
 - [`PROJECT_EXPERIMENT_GUIDE.md`](PROJECT_EXPERIMENT_GUIDE.md)
 
-## Repository Structure
+---
 
-### Core pipeline
+## Core idea
 
-- [`prepare_resum_data.py`](prepare_resum_data.py)
-  - builds the standard LF/HF/validation block files for the cumulative-theta workflow
-- [`convert_csv_to_h5_xlzd.py`](convert_csv_to_h5_xlzd.py)
-  - converts generated CSV/parquet blocks to H5 for the CNP
-- [`xlzd_resum/`](xlzd_resum)
-  - shared preprocessing, theta, config, and dataset utilities
-- [`src/xlzd/`](src/xlzd)
-  - standard settings files for CNP and MF-GP experiments
-- [`src/run_cnp/`](src/run_cnp)
-  - CNP training, prediction, and notebook workflows
-- [`src/run_mfgp/`](src/run_mfgp)
-  - MF-GP fitting, prediction, and visualization workflows
+The detector volume is divided into nested cylindrical shells.
 
-### Experiment folders
+For each simulated event, the model receives:
 
-- [`depth_penetration_experiments/`](depth_penetration_experiments)
-  - event penetration modeling, MLP/VBLL baselines, and Plotly explorers
-- [`lf_augmentations/`](lf_augmentations)
-  - experiments that add synthetic LF trials at existing theta values
-- [`theta_augmentations/`](theta_augmentations)
-  - experiments that add LF support at new synthetic theta values
-- [`xlzd_shell_theta/`](xlzd_shell_theta)
-  - a separate shell-based theta experiment where theta is local rather than cumulative
-
-## Main Workflows
-
-### 1. Standard cumulative-theta workflow
-
-Use this for the original theta definition:
-
-- `theta = (R_max, Z_max)`
-- target = whether an event falls inside that cumulative centered region
-
-Run order:
-
-```bash
-python3 prepare_resum_data.py
-python3 convert_csv_to_h5_xlzd.py
+```text
+detector geometry + source position
 ```
 
-Then run:
+and predicts:
 
-- [`src/run_cnp/cnp_xlzd_workflow.ipynb`](src/run_cnp/cnp_xlzd_workflow.ipynb)
-- [`src/run_mfgp/mfgp_xlzd_workflow.ipynb`](src/run_mfgp/mfgp_xlzd_workflow.ipynb)
-
-Inside the main CNP notebook, set `EXPERIMENT` to one of:
-
-- `default`
-- `minibatch`
-- `fixedcontext`
-- `fullpass`
-
-### 2. Shell-theta workflow
-
-Use this for the alternative shell-based theta definition:
-
-- `theta = (r_shell, z_shell)`
-- target = whether an event falls near a local shell-centered region
-
-Run order:
-
-```bash
-python3 xlzd_shell_theta/prepare_shell_theta_data.py
-python3 xlzd_shell_theta/convert_shell_theta_to_h5.py
+```text
+a probability distribution over detector shells
 ```
 
-Then run:
+The workflow then aggregates those event-level predictions at each detector geometry and combines low- and high-fidelity information with an MFGP.
 
-- [`xlzd_shell_theta/00_shell_theta_cnp_workflow.ipynb`](xlzd_shell_theta/00_shell_theta_cnp_workflow.ipynb)
-- [`xlzd_shell_theta/01_shell_theta_mfgp.ipynb`](xlzd_shell_theta/01_shell_theta_mfgp.ipynb)
+At a high level:
 
-This shell-theta workflow is intentionally separate from the standard cumulative-theta workflow.
+```text
+Raw simulated events
+        │
+        ▼
+Geometry-aware preprocessing
+        │
+        ▼
+LF/HF/Validation HDF5 blocks
+        │
+        ▼
+Conditional Neural Process
+        │
+        ├── event-level shell predictions
+        └── geometry-level aggregated shell probabilities
+                         │
+                         ▼
+              Multi-Fidelity Gaussian Process
+                         │
+                         ▼
+          geometry-response mean and uncertainty
+```
 
-## CNP Workflows
+This structure separates two related problems:
 
-Main notebook:
+1. **Event-level modeling:** determine which detector shell an event is likely to occupy.
+2. **Geometry-level modeling:** determine how the aggregate event distribution changes as detector geometry changes.
 
-- [`src/run_cnp/cnp_xlzd_workflow.ipynb`](src/run_cnp/cnp_xlzd_workflow.ipynb)
+---
 
-This is the primary notebook for standard CNP experiments.
+## Repository layout
 
-Archived fixed-path notebooks are kept under:
+```text
+.
+├── archive/
+├── cnp_mfgp/
+├── common/
+├── data/
+├── settings_examples/
+├── PROJECT_EXPERIMENT_GUIDE.md
+├── README.md
+└── requirements.txt
+```
 
-- [`src/run_cnp/additional_experiments/`](src/run_cnp/additional_experiments)
+### [`cnp_mfgp/`](cnp_mfgp/)
 
-These are retained for reference only. The main switchable notebook should be the default entry point.
+The active CNP–MF-GP workflow.
 
-Important CNP scripts:
+This folder contains:
 
-- [`src/run_cnp/cnp_clean_pipeline.py`](src/run_cnp/cnp_clean_pipeline.py)
-  - train/predict pipeline
-- [`src/run_cnp/cnp_predict_per_signal.py`](src/run_cnp/cnp_predict_per_signal.py)
-  - per-event/per-signal prediction export
-- [`src/run_cnp/cnp_validation_prediction.py`](src/run_cnp/cnp_validation_prediction.py)
-  - validation prediction helper
-- [`src/run_cnp/preprocess_mixup_xlzd.py`](src/run_cnp/preprocess_mixup_xlzd.py)
-  - optional mixup preprocessing
+- data preparation;
+- CNP training and prediction;
+- MF-GP fitting and evaluation;
+- synthetic-source emulation;
+- visualization helpers;
+- active configurations;
+- notebooks;
+- examples;
+- generated pipeline outputs;
+- additional experimental branches.
 
-## MF-GP Workflows
+See [`cnp_mfgp/README.md`](cnp_mfgp/README.md) for the complete technical guide.
 
-Main notebook:
+### [`common/`](common/)
 
-- [`src/run_mfgp/mfgp_xlzd_workflow.ipynb`](src/run_mfgp/mfgp_xlzd_workflow.ipynb)
+Shared utilities used by the active pipeline.
 
-Main script:
+These modules handle:
 
-- [`src/run_mfgp/mfgp_clean_pipeline.py`](src/run_mfgp/mfgp_clean_pipeline.py)
+- configuration dataclasses;
+- raw event loading and normalization;
+- LF/HF/validation pool construction;
+- block creation;
+- shell geometry;
+- centered-coordinate calculations;
+- HDF5 serialization;
+- pipeline logging and timing.
 
-This workflow consumes aggregated CNP CSV outputs and produces:
+Code that is useful across multiple workflows belongs here rather than being duplicated inside a model-specific folder.
 
-- MF-GP fits
-- mean/std surfaces
-- parity plots
-- validation plots
-- 3D HTML views where enabled
+### [`data/`](data/)
 
-## Depth Penetration Experiments
+Local raw datasets and file preparation requirements.
 
-Folder:
+This data should not be committed to version control
 
-- [`depth_penetration_experiments/`](depth_penetration_experiments)
+Includes file_manifest.csv - a file that dictates the detector geometry and fidelity of each of the input files
 
-This contains a separate modeling track for event penetration into the detector, including:
+### [`settings_examples/`](settings_examples/)
 
-- global `d_center` prediction
-- grouped axial/radial prediction
-- deterministic MLP and VBLL-head models
-- interactive 2D and 3D Plotly explorers
+Example configuration files and reusable settings templates.
 
-Start with:
+Use these as starting points for new runs. Copy or adapt the relevant files into [`cnp_mfgp/config/`](cnp_mfgp/config/) before changing experiment-specific paths and parameters.
 
-- [`depth_penetration_experiments/README.md`](depth_penetration_experiments/README.md)
+### [`archive/`](archive/)
 
-## LF and Theta Augmentation Experiments
+Older implementations, retired layouts, and historical experiments retained for reference.
 
-These folders contain exploratory work and are not part of the main pipeline:
+Archived files are not part of the default workflow and may depend on paths, data formats, or APIs that are no longer current.
 
-- [`lf_augmentations/`](lf_augmentations)
-- [`theta_augmentations/`](theta_augmentations)
+### [`PROJECT_EXPERIMENT_GUIDE.md`](PROJECT_EXPERIMENT_GUIDE.md)
 
-They are useful when testing whether MF-GP behavior improves with:
+A longer record of:
 
-- more LF support at existing theta values
-- synthetic LF support at nearby or midpoint theta values
+- the development history;
+- previous theta and target definitions;
+- abandoned or superseded approaches;
+- experiment-specific reasoning;
+- architectural changes.
 
-## Outputs
+Use the README files for the current workflow and the experiment guide for historical context.
 
-Generated artifacts are typically written under:
+### [`requirements.txt`](requirements.txt)
 
-- `outputs/`
-- `outputs_shell_theta/`
-- `data/out/cnp/`
-- `data/out/mfgp/`
-- experiment-specific `artifacts/` folders
+Python dependencies for the repository.
 
-These outputs are generally not intended to be committed unless explicitly needed.
+---
 
-## Environment
+## Installation
 
-Install dependencies with:
+Create and activate a virtual environment from the repository root:
 
 ```bash
 python3 -m venv .venv
@@ -194,24 +167,124 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Suggested Entry Points
+A CUDA-enabled PyTorch installation is optional. The CNP uses CUDA when available unless a device is explicitly selected.
 
-If you are new to the repo, start here:
+---
 
-1. [`prepare_resum_data.py`](prepare_resum_data.py)
-2. [`convert_csv_to_h5_xlzd.py`](convert_csv_to_h5_xlzd.py)
-3. [`src/run_cnp/cnp_xlzd_workflow.ipynb`](src/run_cnp/cnp_xlzd_workflow.ipynb)
-4. [`src/run_mfgp/mfgp_xlzd_workflow.ipynb`](src/run_mfgp/mfgp_xlzd_workflow.ipynb)
+## Starting a new run
 
-If you are working on shell theta, start here:
+Run commands from the repository root.
 
-1. [`xlzd_shell_theta/prepare_shell_theta_data.py`](xlzd_shell_theta/prepare_shell_theta_data.py)
-2. [`xlzd_shell_theta/convert_shell_theta_to_h5.py`](xlzd_shell_theta/convert_shell_theta_to_h5.py)
-3. [`xlzd_shell_theta/00_shell_theta_cnp_workflow.ipynb`](xlzd_shell_theta/00_shell_theta_cnp_workflow.ipynb)
-4. [`xlzd_shell_theta/01_shell_theta_mfgp.ipynb`](xlzd_shell_theta/01_shell_theta_mfgp.ipynb)
+A typical workflow is:
 
-## Notes
+```bash
+# 1. Prepare event-level shell-classification blocks
+python cnp_mfgp/prepare_cnp_mfgp_data.py \
+  --config cnp_mfgp/config/pipeline_config.json \
+  --manifest file_manifest.csv
 
-- The standard cumulative-theta workflow and the shell-theta workflow are different experiments and should not be mixed.
-- The notebooks under `src/run_cnp/additional_experiments/` are archived variants, not the main entry points.
-- The LF augmentation and theta augmentation folders are exploratory branches rather than the default pipeline.
+# 2. Train the CNP
+python cnp_mfgp/cnp_clean_pipeline.py \
+  --config cnp_mfgp/config/settings_shell_minibatch.yaml \
+  --device cuda \
+  train
+
+# 3. Predict on configured LF/HF datasets
+python cnp_mfgp/cnp_clean_pipeline.py \
+  --config cnp_mfgp/config/settings_shell_minibatch.yaml \
+  --device cuda \
+  predict \
+  --model-path cnp_mfgp/outputs/cnp/<checkpoint>.pth \
+  --output-suffix output
+
+# 4. Fit the MF-GP
+python cnp_mfgp/mfgp_clean_pipeline.py \
+  --config cnp_mfgp/config/settings_shell_minibatch.yaml \
+  --cnp-csv cnp_mfgp/outputs/cnp/<aggregated-output>.csv
+```
+
+The exact paths are controlled by the JSON and YAML configuration files.
+
+Detailed setup and command options are documented in [`cnp_mfgp/README.md`](cnp_mfgp/README.md).
+
+---
+
+## Configuration strategy
+
+The repository separates reusable examples from active experiment configuration:
+
+```text
+settings_examples/   reusable templates
+cnp_mfgp/config/     settings used by the active pipeline
+```
+
+The data-preparation stage uses JSON.
+
+The CNP and MF-GP stages use YAML.
+
+Relative paths inside a CNP/MF-GP YAML file are resolved relative to that YAML file. Explicitly passing `--config` is recommended for all command-line runs.
+
+---
+
+## Development conventions
+
+### Run from the repository root
+
+Several modules locate the repository by searching parent directories for:
+
+```text
+README.md
+PROJECT_EXPERIMENT_GUIDE.md
+```
+
+Running from the root also ensures that imports from `common` and `cnp_mfgp` resolve consistently.
+
+### Keep active and historical work separate
+
+Use:
+
+- `cnp_mfgp/` for the active pipeline;
+- `cnp_mfgp/additional_experiments/` for current experimental variations;
+- `archive/` for retired structures and obsolete implementations.
+
+### Keep generated files out of source folders
+
+Model checkpoints, prediction tables, plots, and interactive HTML files should be written to configured output directories, normally under:
+
+```text
+cnp_mfgp/outputs/
+```
+
+Large raw and prepared datasets should remain under:
+
+```text
+data/
+```
+
+### Put reusable code in `common`
+
+Geometry, I/O, HDF5, block-building, and dataset-splitting logic should remain model-independent whenever possible.
+
+---
+
+## Current primary workflow
+
+The supported active path is:
+
+```text
+cnp_mfgp/prepare_cnp_mfgp_data.py
+        ↓
+cnp_mfgp/cnp_clean_pipeline.py
+        ↓
+cnp_mfgp/mfgp_clean_pipeline.py
+```
+
+The supporting modules are:
+
+```text
+cnp_mfgp/emulation.py
+cnp_mfgp/visualize.py
+common/
+```
+
+Start with [`cnp_mfgp/README.md`](cnp_mfgp/README.md) before running or modifying the pipeline.
