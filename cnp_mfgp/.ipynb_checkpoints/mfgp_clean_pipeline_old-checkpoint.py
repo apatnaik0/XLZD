@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Clean multi-fidelity GP pipeline for categorical CNP shell outputs.
+"""Clean multi-fidelity GP pipeline for XLZD CNP outputs.
 
-Fidelity is read exclusively from the CNP CSV, where it originates from
-``file_manifest.csv``.  For shell simulations, each MF-GP input point is
-``(detector theta..., shell_index)`` so the shell distribution is preserved
-instead of being averaged across shell classes.
+This module avoids any dependency on `resum` helper code.
+Model: two-level autoregressive MF-GP (Kennedy-O'Hagan style):
+- LF GP on (theta -> y_cnp) for fidelity=0
+- rho estimated on HF points
+- Discrepancy GP on (theta -> y_raw - rho * LF(theta)) for fidelity=1
 
-The model is a two-level autoregressive MF-GP (Kennedy-O'Hagan style):
-- LF GP on manifest-selected low-fidelity CNP probabilities
-- rho estimated at high-fidelity input points
-- discrepancy GP on high-fidelity shell occupation minus rho * LF prediction
+Outputs:
+- trained model artifacts
+- metrics JSON
+- prediction CSV (observed points + grid)
+- plots similar to old notebook style
 """
 
 from __future__ import annotations
@@ -17,7 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -27,16 +28,10 @@ import numpy as np
 import pandas as pd
 import yaml
 from matplotlib.lines import Line2D
-from sklearn.decomposition import PCA
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
-
-
-FIDELITY_LF = 0
-FIDELITY_HF = 1
-SHELL_COLUMN = "shell_index"
 
 
 @dataclass
@@ -47,10 +42,6 @@ class MFGPRuntimeConfig:
     theta_headers: List[str]
     theta_min: List[float]
     theta_max: List[float]
-    n_shells: int
-    pca_components: int | float
-    pca_epsilon: float
-    distribution_mc_samples: int
     out_dir_cnp: Path
     out_dir_mfgp: Path
 
@@ -80,7 +71,6 @@ def load_runtime_config(config_path: str | Path) -> MFGPRuntimeConfig:
     raw = yaml.safe_load(cp.read_text())
     sim = raw.get("simulation_settings", {})
     paths = raw.get("path_settings", {})
-    mfgp = raw.get("mfgp_settings", {})
     base = cp.parent
 
     return MFGPRuntimeConfig(
@@ -90,47 +80,46 @@ def load_runtime_config(config_path: str | Path) -> MFGPRuntimeConfig:
         theta_headers=list(sim.get("theta_headers", ["R_max", "Z_max"])),
         theta_min=[float(x) for x in sim.get("theta_min", [0.0, 0.0])],
         theta_max=[float(x) for x in sim.get("theta_max", [1.0, 1.0])],
-        n_shells=int(sim.get("n_shells", 100)),
-        pca_components=mfgp.get("pca_components", 0.995),
-        pca_epsilon=float(mfgp.get("pca_epsilon", 1e-8)),
-        distribution_mc_samples=int(mfgp.get("distribution_mc_samples", 500)),
         out_dir_cnp=_resolve_path(paths.get("path_out_cnp", "../../data/out/cnp"), base),
         out_dir_mfgp=_resolve_path(paths.get("path_out_mfgp", "../../data/out/mfgp"), base),
     )
 
 
 def discover_cnp_output_csv(out_dir_cnp: Path, version: str, prefer_validation: bool = False) -> Path:
-    """Find an aggregated CNP CSV compatible with the new shell structure."""
     out_dir_cnp = out_dir_cnp.resolve()
     if not out_dir_cnp.exists():
         raise FileNotFoundError(f"CNP output directory does not exist: {out_dir_cnp}")
 
-    required = {"iteration", "fidelity", "shell_index", "y_cnp", "y_cnp_err", "y_raw"}
-    candidates: list[Path] = []
-    for path in out_dir_cnp.glob(f"cnp_{version}_*epochs.csv"):
-        if not path.is_file():
-            continue
-        lowered = path.name.lower()
-        if any(tag in lowered for tag in ("all_shells", "best_shell", "history")):
-            continue
-        try:
-            columns = set(pd.read_csv(path, nrows=0).columns)
-        except Exception:
-            continue
-        if required.issubset(columns):
-            candidates.append(path)
+    # Prefer regular aggregated output for MF-GP fitting; exclude per-signal exports.
+    regular = sorted(
+        [
+            p
+            for p in out_dir_cnp.glob(f"cnp_{version}_output_*epochs.csv")
+            if ("validation" not in p.name and "per_signal" not in p.name)
+        ]
+    )
+    validation = sorted(
+        [
+            p
+            for p in out_dir_cnp.glob(f"cnp_{version}_output_validation_*epochs.csv")
+            if "per_signal" not in p.name
+        ]
+    )
+    if prefer_validation:
+        candidates = validation + regular
+    else:
+        candidates = regular + validation
 
+    candidates = [c for c in candidates if c.is_file()]
     if not candidates:
         raise FileNotFoundError(
-            f"No aggregated categorical CNP CSV found in {out_dir_cnp} for version={version}. "
-            "Expected columns include iteration, fidelity, shell_index, y_cnp, y_cnp_err, and y_raw."
+            f"No CNP CSV found in {out_dir_cnp} for version={version}. "
+            f"Expected pattern like cnp_{version}_output_*epochs.csv"
         )
 
-    validation = [p for p in candidates if "validation" in p.name.lower()]
-    regular = [p for p in candidates if "validation" not in p.name.lower()]
-    ordered = (validation + regular) if prefer_validation else (regular + validation)
-    ordered.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return ordered[0]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
 
 def _missing_csv_message(csv_path: Path, out_dir_cnp: Path, version: str) -> str:
     nearby = sorted(out_dir_cnp.glob(f"cnp_{version}_*epochs.csv")) if out_dir_cnp.exists() else []
@@ -143,94 +132,63 @@ def _missing_csv_message(csv_path: Path, out_dir_cnp: Path, version: str) -> str
 
 
 def _aggregate_rows(df: pd.DataFrame, x_cols: Sequence[str]) -> pd.DataFrame:
-    """Collapse duplicate CNP rows without collapsing shell classes.
-
-    ``x_cols`` includes ``shell_index`` for categorical shell data.  When the
-    CNP CSV already contains aggregated rows, ``n_samples`` is used as a weight
-    so combining multiple CSV chunks remains statistically correct.
-    """
+    # Multiple rows can share the same theta/fidelity/iteration; collapse to stable means.
     keys = [*x_cols, "fidelity", "iteration"]
-    required = {*keys, "y_cnp", "y_cnp_err", "y_raw"}
-    missing = sorted(required - set(df.columns))
-    if missing:
-        raise ValueError(f"Missing required columns in CNP CSV: {missing}")
-
-    work = df.copy()
-    work["_weight"] = (
-        pd.to_numeric(work["n_samples"], errors="coerce").fillna(1.0)
-        if "n_samples" in work.columns
-        else 1.0
-    )
-    if (work["_weight"] <= 0).any():
-        raise ValueError("n_samples must be positive when present.")
-
-    for column in [*x_cols, "fidelity", "iteration", "y_cnp", "y_cnp_err", "y_raw"]:
-        work[column] = pd.to_numeric(work[column], errors="coerce")
-    if work[[*x_cols, "fidelity", "iteration", "y_cnp", "y_cnp_err", "y_raw"]].isna().any().any():
-        raise ValueError("CNP CSV contains non-numeric or missing MF-GP values.")
-
-    work["_y_cnp_weighted"] = work["y_cnp"] * work["_weight"]
-    work["_y_raw_weighted"] = work["y_raw"] * work["_weight"]
-    work["_y_cnp_err_sq_weighted"] = np.square(work["y_cnp_err"]) * work["_weight"]
-
-    out = (
-        work.groupby(keys, dropna=False, as_index=False)
-        .agg(
-            n_samples_agg=("_weight", "sum"),
-            y_cnp_sum=("_y_cnp_weighted", "sum"),
-            y_raw_sum=("_y_raw_weighted", "sum"),
-            y_cnp_err_sq_sum=("_y_cnp_err_sq_weighted", "sum"),
-        )
-    )
-    out["y_cnp"] = out["y_cnp_sum"] / out["n_samples_agg"]
-    out["y_raw"] = out["y_raw_sum"] / out["n_samples_agg"]
-    out["y_cnp_err"] = np.sqrt(out["y_cnp_err_sq_sum"] / out["n_samples_agg"])
-    return out[[*keys, "y_cnp", "y_cnp_err", "y_raw", "n_samples_agg"]]
-
-
-def _resolve_fidelity_pair(fidelities: Sequence[int]) -> tuple[int, int]:
-    """Require the manifest-defined binary fidelity convention: 0=LF, 1=HF."""
-    available = sorted({int(value) for value in fidelities})
-    if available != [0, 1]:
-        raise ValueError(
-            "This two-level MF-GP requires both manifest fidelities 0 (LF) and 1 (HF). "
-            f"Found {available}."
-        )
-    return 0, 1
+    for c in ["y_cnp", "y_cnp_err", "y_raw"]:
+        if c not in df.columns:
+            raise ValueError(f"Missing column '{c}' in CNP CSV")
+    agg_map: Dict[str, str] = {
+        "y_cnp": "mean",
+        "y_cnp_err": "mean",
+        "y_raw": "mean",
+    }
+    if "n_samples" in df.columns:
+        agg_map["n_samples"] = "mean"
+    out = df.groupby(keys, dropna=False, as_index=False).agg(agg_map)
+    if "n_samples" in out.columns:
+        out = out.rename(columns={"n_samples": "n_samples_agg"})
+    else:
+        # Fall back to grouped row count when input has no n_samples column.
+        group_sizes = df.groupby(keys, dropna=False).size().reset_index(name="n_samples_agg")
+        out = out.merge(group_sizes, on=keys, how="left")
+    return out
 
 
 def load_mfgp_training_data(
     csv_path: str | Path,
     x_cols: Sequence[str],
     iteration: int = 0,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int, int]:
+    lf_fidelity: int = 0,
+    hf_fidelity: int = 1,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = pd.read_csv(csv_path)
+    required = set([*x_cols, "iteration", "fidelity", "y_cnp", "y_cnp_err", "y_raw"])
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Missing required columns in CNP CSV: {missing}")
+
     df = _aggregate_rows(df, x_cols)
     df = df[df["iteration"].astype(int) == int(iteration)].copy()
     if df.empty:
         raise ValueError(f"No rows found for iteration={iteration}")
 
-    selected_lf, selected_hf = _resolve_fidelity_pair(
-        df["fidelity"].astype(int).unique().tolist()
-    )
-    lf = df[df["fidelity"].astype(int) == selected_lf].copy()
-    hf = df[df["fidelity"].astype(int) == selected_hf].copy()
+    lf = df[df["fidelity"].astype(int) == int(lf_fidelity)].copy()
+    hf = df[df["fidelity"].astype(int) == int(hf_fidelity)].copy()
 
     if lf.empty or hf.empty:
         raise ValueError(
-            f"Need both selected fidelities at iteration={iteration}. "
-            f"Found fidelity {selected_lf}: {len(lf)} rows; "
-            f"fidelity {selected_hf}: {len(hf)} rows."
+            f"Need both LF and HF rows at iteration={iteration}. "
+            f"Found lf={len(lf)}, hf={len(hf)}"
         )
 
-    for column in x_cols:
-        lf[column] = lf[column].astype(float)
-        hf[column] = hf[column].astype(float)
+    for c in x_cols:
+        lf[c] = lf[c].astype(float)
+        hf[c] = hf[c].astype(float)
     lf["y_cnp"] = lf["y_cnp"].astype(float)
     lf["y_cnp_err"] = lf["y_cnp_err"].astype(float)
     hf["y_raw"] = hf["y_raw"].astype(float)
 
-    return df, lf, hf, selected_lf, selected_hf
+    return df, lf, hf
 
 
 class CleanAutoregressiveMFGP:
@@ -274,13 +232,10 @@ class CleanAutoregressiveMFGP:
             raise ValueError("x_lf and x_hf must be 2D")
         if x_lf.shape[1] != x_hf.shape[1]:
             raise ValueError("x_lf and x_hf must have same feature dimension")
-        if len(x_lf) < 1 or len(x_hf) < 1:
-            raise ValueError("Need at least one LF and one HF detector geometry")
+        if len(x_lf) < 3 or len(x_hf) < 3:
+            raise ValueError("Need at least 3 LF and 3 HF points")
 
         self.x_dim = x_lf.shape[1]
-        small_data = min(len(x_lf), len(x_hf)) < 3
-        optimizer = None if small_data else "fmin_l_bfgs_b"
-        n_restarts = 0 if small_data else 2
 
         self.x_scaler = StandardScaler().fit(np.vstack([x_lf, x_hf]))
         x_lf_s = self.x_scaler.transform(x_lf)
@@ -293,8 +248,7 @@ class CleanAutoregressiveMFGP:
             kernel=self._kernel(self.x_dim),
             alpha=self.alpha_lf,
             normalize_y=False,
-            optimizer=optimizer,
-            n_restarts_optimizer=n_restarts,
+            n_restarts_optimizer=2,
             random_state=self.random_state,
         )
         if verbose:
@@ -318,9 +272,8 @@ class CleanAutoregressiveMFGP:
             kernel=self._kernel(self.x_dim),
             alpha=self.alpha_hf,
             normalize_y=False,
-            optimizer=optimizer,
-            n_restarts_optimizer=n_restarts,
-            random_state=self.random_state + 1000,
+            n_restarts_optimizer=2,
+            random_state=self.random_state,
         )
         if verbose:
             print("[fit] Training HF discrepancy GP...")
@@ -359,407 +312,6 @@ class CleanAutoregressiveMFGP:
 
 
 @dataclass
-class GeometryDistributionData:
-    """One row per detector geometry and fidelity with shell-probability lists."""
-
-    frame: pd.DataFrame
-    theta: np.ndarray
-    cnp_distributions: np.ndarray
-    raw_distributions: np.ndarray
-    cnp_uncertainties: np.ndarray
-
-
-def _normalize_distributions(values: np.ndarray, epsilon: float) -> np.ndarray:
-    arr = np.asarray(values, dtype=float)
-    if arr.ndim != 2:
-        raise ValueError(f"Expected a 2D shell-distribution matrix, got {arr.shape}")
-    if not np.isfinite(arr).all():
-        raise ValueError("Shell distributions contain non-finite values")
-    if (arr < -1e-12).any():
-        raise ValueError("Shell distributions contain negative probabilities")
-    arr = np.maximum(arr, 0.0) + float(epsilon)
-    totals = arr.sum(axis=1, keepdims=True)
-    if (totals <= 0).any():
-        raise ValueError("A shell distribution has zero total probability")
-    return arr / totals
-
-
-def _validate_complete_shell_groups(
-    df: pd.DataFrame,
-    theta_headers: Sequence[str],
-    n_shells: int,
-) -> None:
-    expected = set(range(1, int(n_shells) + 1))
-    group_columns = [*theta_headers, "iteration", "fidelity"]
-    problems: list[str] = []
-    for key, group in df.groupby(group_columns, dropna=False):
-        shell_values = group[SHELL_COLUMN].astype(int)
-        actual = set(shell_values.tolist())
-        missing = sorted(expected - actual)
-        unexpected = sorted(actual - expected)
-        duplicates = int(shell_values.duplicated().sum())
-        if missing or unexpected or duplicates:
-            problems.append(
-                f"group={key}: missing={missing[:10]}, unexpected={unexpected[:10]}, "
-                f"duplicates={duplicates}"
-            )
-    if problems:
-        raise ValueError(
-            "Each detector geometry/fidelity must contain exactly one aggregate row "
-            f"for every shell 1..{n_shells}.\n" + "\n".join(problems[:10])
-        )
-
-
-def load_geometry_distribution_data(
-    csv_path: str | Path,
-    theta_headers: Sequence[str],
-    n_shells: int,
-    iteration: int = 0,
-    *,
-    require_both_fidelities: bool = True,
-    epsilon: float = 1e-8,
-) -> GeometryDistributionData:
-    """Load the existing long-form CNP CSV and pivot it internally.
-
-    The CNP file format is unchanged. Internally, every returned dataframe row
-    represents one detector geometry and one manifest-defined fidelity. The
-    list-valued columns contain the ordered shell values for shells 1..N.
-    """
-
-    long_df = _aggregate_rows(pd.read_csv(csv_path), [*theta_headers, SHELL_COLUMN])
-    long_df = long_df[long_df["iteration"].astype(int) == int(iteration)].copy()
-    if long_df.empty:
-        raise ValueError(f"No rows found for iteration={iteration}")
-
-    fidelities = sorted(long_df["fidelity"].astype(int).unique().tolist())
-    allowed = {FIDELITY_LF, FIDELITY_HF}
-    if not set(fidelities).issubset(allowed):
-        raise ValueError(
-            f"fidelity must be 0 (LF) or 1 (HF); found {fidelities}"
-        )
-    if require_both_fidelities and fidelities != [FIDELITY_LF, FIDELITY_HF]:
-        raise ValueError(
-            "Training CNP CSV must contain both fidelity=0 and fidelity=1; "
-            f"found {fidelities}"
-        )
-
-    long_df[SHELL_COLUMN] = long_df[SHELL_COLUMN].astype(int)
-    _validate_complete_shell_groups(long_df, theta_headers, n_shells)
-
-    rows: list[dict[str, object]] = []
-    group_columns = [*theta_headers, "iteration", "fidelity"]
-    for key, group in long_df.groupby(group_columns, dropna=False, sort=True):
-        group = group.sort_values(SHELL_COLUMN)
-        if not isinstance(key, tuple):
-            key = (key,)
-        row: dict[str, object] = dict(zip(group_columns, key))
-        row["shell_indices"] = group[SHELL_COLUMN].astype(int).tolist()
-        row["cnp_shell_probabilities"] = group["y_cnp"].astype(float).tolist()
-        row["raw_shell_probabilities"] = group["y_raw"].astype(float).tolist()
-        row["cnp_shell_uncertainties"] = group["y_cnp_err"].astype(float).tolist()
-        row["n_samples_by_shell"] = group["n_samples_agg"].astype(float).tolist()
-        rows.append(row)
-
-    frame = pd.DataFrame(rows).sort_values(group_columns).reset_index(drop=True)
-    theta = frame[list(theta_headers)].to_numpy(dtype=float)
-    cnp = _normalize_distributions(
-        np.vstack(frame["cnp_shell_probabilities"].map(np.asarray)), epsilon
-    )
-    raw = _normalize_distributions(
-        np.vstack(frame["raw_shell_probabilities"].map(np.asarray)), epsilon
-    )
-    cnp_uncertainty = np.vstack(
-        frame["cnp_shell_uncertainties"].map(np.asarray)
-    ).astype(float)
-    return GeometryDistributionData(
-        frame=frame,
-        theta=theta,
-        cnp_distributions=cnp,
-        raw_distributions=raw,
-        cnp_uncertainties=cnp_uncertainty,
-    )
-
-
-class CLRPrincipalComponents:
-    """Compress complete shell distributions in centered-log-ratio space."""
-
-    def __init__(self, n_components: int | float = 0.995, epsilon: float = 1e-8) -> None:
-        self.n_components = n_components
-        self.epsilon = float(epsilon)
-        self.pca: Optional[PCA] = None
-
-    def _clr(self, distributions: np.ndarray) -> np.ndarray:
-        simplex = _normalize_distributions(distributions, self.epsilon)
-        logs = np.log(simplex)
-        return logs - logs.mean(axis=1, keepdims=True)
-
-    def fit(self, distributions: np.ndarray) -> "CLRPrincipalComponents":
-        clr = self._clr(distributions)
-        max_components = min(clr.shape[0], clr.shape[1])
-        requested = self.n_components
-        if isinstance(requested, int):
-            requested = max(1, min(int(requested), max_components))
-        else:
-            requested = float(requested)
-            if not 0.0 < requested <= 1.0:
-                raise ValueError("pca_components must be an integer or a fraction in (0, 1]")
-        self.pca = PCA(n_components=requested, svd_solver="full")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            self.pca.fit(clr)
-        return self
-
-    def transform(self, distributions: np.ndarray) -> np.ndarray:
-        if self.pca is None:
-            raise RuntimeError("PCA compressor has not been fitted")
-        return self.pca.transform(self._clr(distributions))
-
-    def inverse_transform(self, coefficients: np.ndarray) -> np.ndarray:
-        if self.pca is None:
-            raise RuntimeError("PCA compressor has not been fitted")
-        clr = self.pca.inverse_transform(np.asarray(coefficients, dtype=float))
-        clr = clr - clr.max(axis=1, keepdims=True)
-        values = np.exp(clr)
-        return values / values.sum(axis=1, keepdims=True)
-
-
-class DistributionAutoregressiveMFGP:
-    """One autoregressive MF-GP per latent distribution coefficient."""
-
-    def __init__(
-        self,
-        pca_components: int | float = 0.995,
-        pca_epsilon: float = 1e-8,
-        random_state: int = 42,
-        alpha_lf: float = 1e-8,
-        alpha_hf: float = 1e-8,
-    ) -> None:
-        self.compressor = CLRPrincipalComponents(pca_components, pca_epsilon)
-        self.random_state = int(random_state)
-        self.alpha_lf = float(alpha_lf)
-        self.alpha_hf = float(alpha_hf)
-        self.models: list[CleanAutoregressiveMFGP] = []
-
-    def fit(
-        self,
-        x_lf: np.ndarray,
-        distributions_lf: np.ndarray,
-        x_hf: np.ndarray,
-        distributions_hf: np.ndarray,
-        *,
-        verbose: bool = False,
-    ) -> "DistributionAutoregressiveMFGP":
-        self.compressor.fit(np.vstack([distributions_lf, distributions_hf]))
-        lf_coefficients = self.compressor.transform(distributions_lf)
-        hf_coefficients = self.compressor.transform(distributions_hf)
-        self.models = []
-        for component in range(lf_coefficients.shape[1]):
-            if verbose:
-                print(
-                    f"[fit] Latent component {component + 1}/"
-                    f"{lf_coefficients.shape[1]}"
-                )
-            scalar_model = CleanAutoregressiveMFGP(
-                random_state=self.random_state + component,
-                alpha_lf=self.alpha_lf,
-                alpha_hf=self.alpha_hf,
-            )
-            scalar_model.fit(
-                x_lf=x_lf,
-                y_lf=lf_coefficients[:, component],
-                x_hf=x_hf,
-                y_hf=hf_coefficients[:, component],
-                verbose=False,
-            )
-            self.models.append(scalar_model)
-        return self
-
-    def predict_latent(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if not self.models:
-            raise RuntimeError("Distribution MF-GP has not been fitted")
-        means: list[np.ndarray] = []
-        stds: list[np.ndarray] = []
-        for scalar_model in self.models:
-            mean, std, _, _ = scalar_model.predict(x)
-            means.append(mean)
-            stds.append(std)
-        return np.column_stack(means), np.column_stack(stds)
-
-    def predict_distribution(
-        self,
-        x: np.ndarray,
-        *,
-        mc_samples: int = 500,
-        random_state: Optional[int] = None,
-    ) -> dict[str, np.ndarray]:
-        latent_mean, latent_std = self.predict_latent(x)
-        point = self.compressor.inverse_transform(latent_mean)
-        if mc_samples <= 0:
-            return {
-                "mean": point,
-                "std": np.zeros_like(point),
-                "q025": point,
-                "q975": point,
-                "latent_mean": latent_mean,
-                "latent_std": latent_std,
-            }
-        rng = np.random.default_rng(
-            self.random_state if random_state is None else int(random_state)
-        )
-        draws = []
-        for _ in range(int(mc_samples)):
-            sample = rng.normal(latent_mean, np.maximum(latent_std, 1e-12))
-            draws.append(self.compressor.inverse_transform(sample))
-        stack = np.stack(draws, axis=0)
-        return {
-            "mean": stack.mean(axis=0),
-            "std": stack.std(axis=0, ddof=0),
-            "q025": np.quantile(stack, 0.025, axis=0),
-            "q975": np.quantile(stack, 0.975, axis=0),
-            "latent_mean": latent_mean,
-            "latent_std": latent_std,
-        }
-
-
-def _distribution_metrics(truth: np.ndarray, prediction: np.ndarray) -> dict[str, float]:
-    truth = _normalize_distributions(truth, 1e-12)
-    prediction = _normalize_distributions(prediction, 1e-12)
-    midpoint = 0.5 * (truth + prediction)
-    js = 0.5 * (
-        np.sum(truth * np.log(truth / midpoint), axis=1)
-        + np.sum(prediction * np.log(prediction / midpoint), axis=1)
-    )
-    tv = 0.5 * np.sum(np.abs(truth - prediction), axis=1)
-    rmse = np.sqrt(np.mean(np.square(truth - prediction), axis=1))
-    mae = np.mean(np.abs(truth - prediction), axis=1)
-    return {
-        "mean_shell_rmse": float(rmse.mean()),
-        "mean_shell_mae": float(mae.mean()),
-        "mean_total_variation": float(tv.mean()),
-        "mean_jensen_shannon": float(js.mean()),
-        "max_sum_error": float(np.max(np.abs(prediction.sum(axis=1) - 1.0))),
-    }
-
-
-def _json_list(values: np.ndarray | Sequence[float]) -> str:
-    return json.dumps(np.asarray(values, dtype=float).tolist())
-
-
-def _prediction_rows(
-    geometry_frame: pd.DataFrame,
-    prediction: dict[str, np.ndarray],
-    *,
-    iteration: int,
-    fidelity: int,
-    truth: Optional[np.ndarray] = None,
-) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-    for index, geometry in geometry_frame.reset_index(drop=True).iterrows():
-        row = geometry.to_dict()
-        row["iteration"] = int(iteration)
-        row["fidelity"] = int(fidelity)
-        row["predicted_shell_probabilities"] = _json_list(prediction["mean"][index])
-        row["predicted_shell_std"] = _json_list(prediction["std"][index])
-        row["predicted_shell_q025"] = _json_list(prediction["q025"][index])
-        row["predicted_shell_q975"] = _json_list(prediction["q975"][index])
-        if truth is not None:
-            row["true_shell_probabilities"] = _json_list(truth[index])
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def _geometry_grid_frame(
-    runtime: MFGPRuntimeConfig,
-    lf_theta: np.ndarray,
-    hf_theta: np.ndarray,
-    points_per_axis: int,
-) -> pd.DataFrame:
-    combined = np.vstack([lf_theta, hf_theta])
-    if len(runtime.theta_headers) != 2 or points_per_axis <= 0:
-        return pd.DataFrame(combined, columns=runtime.theta_headers).drop_duplicates()
-    if len(runtime.theta_min) == 2 and len(runtime.theta_max) == 2:
-        lower = np.asarray(runtime.theta_min, dtype=float)
-        upper = np.asarray(runtime.theta_max, dtype=float)
-    else:
-        lower = combined.min(axis=0)
-        upper = combined.max(axis=0)
-    if np.allclose(lower, upper):
-        return pd.DataFrame([lower], columns=runtime.theta_headers)
-    axis0 = np.linspace(lower[0], upper[0], int(points_per_axis))
-    axis1 = np.linspace(lower[1], upper[1], int(points_per_axis))
-    mesh0, mesh1 = np.meshgrid(axis0, axis1, indexing="xy")
-    return pd.DataFrame(
-        np.column_stack([mesh0.ravel(), mesh1.ravel()]),
-        columns=runtime.theta_headers,
-    )
-
-
-def _plot_distribution_observations(
-    geometry_frame: pd.DataFrame,
-    truth: np.ndarray,
-    out_path: Path,
-    title: str,
-    max_geometries: int = 8,
-) -> None:
-    fig, ax = plt.subplots(figsize=(10, 6))
-    shells = np.arange(1, truth.shape[1] + 1)
-    for index in range(min(len(geometry_frame), max_geometries)):
-        label = ", ".join(
-            f"{column}={geometry_frame.iloc[index][column]:g}"
-            for column in geometry_frame.columns
-        )
-        ax.plot(shells, truth[index], label=label)
-    ax.set_xlabel("Shell index")
-    ax.set_ylabel("Probability")
-    ax.set_title(title)
-    ax.grid(alpha=0.25)
-    if len(geometry_frame):
-        ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=170)
-    plt.close(fig)
-
-
-def _plot_distribution_predictions(
-    geometry_frame: pd.DataFrame,
-    prediction: dict[str, np.ndarray],
-    out_path: Path,
-    title: str,
-    truth: Optional[np.ndarray] = None,
-    max_geometries: int = 6,
-) -> None:
-    count = min(len(geometry_frame), max_geometries)
-    fig, axes = plt.subplots(count, 1, figsize=(11, max(4, 3.3 * count)), squeeze=False)
-    shells = np.arange(1, prediction["mean"].shape[1] + 1)
-    for index in range(count):
-        ax = axes[index, 0]
-        mean = prediction["mean"][index]
-        ax.plot(shells, mean, label="MF-GP mean")
-        ax.fill_between(
-            shells,
-            prediction["q025"][index],
-            prediction["q975"][index],
-            alpha=0.25,
-            label="95% interval",
-        )
-        if truth is not None:
-            ax.plot(shells, truth[index], linestyle="--", label="HF truth")
-        label = ", ".join(
-            f"{column}={geometry_frame.iloc[index][column]:g}"
-            for column in geometry_frame.columns
-        )
-        ax.set_title(label)
-        ax.set_xlabel("Shell index")
-        ax.set_ylabel("Probability")
-        ax.grid(alpha=0.25)
-        ax.legend(fontsize=8)
-    fig.suptitle(title)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=170)
-    plt.close(fig)
-
-
-@dataclass
 class MFGPResult:
     cnp_csv: Path
     model_json: Path
@@ -793,146 +345,6 @@ def _grid_from_bounds(theta_min: Sequence[float], theta_max: Sequence[float], n:
     y = np.linspace(float(theta_min[1]), float(theta_max[1]), n)
     gx, gy = np.meshgrid(x, y, indexing="xy")
     return np.column_stack([gx.ravel(), gy.ravel()])
-
-
-
-def _shell_grid_from_data(
-    lf: pd.DataFrame,
-    hf: pd.DataFrame,
-    theta_headers: Sequence[str],
-    shell_column: str = SHELL_COLUMN,
-) -> pd.DataFrame:
-    """Build every observed detector geometry crossed with every shell class."""
-    geometry = (
-        pd.concat([lf[list(theta_headers)], hf[list(theta_headers)]], ignore_index=True)
-        .drop_duplicates()
-        .sort_values(list(theta_headers), kind="mergesort")
-        .reset_index(drop=True)
-    )
-    shells = np.sort(
-        pd.concat([lf[shell_column], hf[shell_column]], ignore_index=True)
-        .astype(int)
-        .unique()
-    )
-    if geometry.empty or len(shells) == 0:
-        raise ValueError("Cannot build shell prediction grid from empty geometry or shell values.")
-
-    geometry = geometry.copy()
-    geometry["_cross"] = 1
-    shell_df = pd.DataFrame({shell_column: shells, "_cross": 1})
-    return geometry.merge(shell_df, on="_cross", how="inner").drop(columns="_cross")
-
-
-def _geometry_label(row: pd.Series, theta_headers: Sequence[str]) -> str:
-    return ", ".join(f"{name}={float(row[name]):.5g}" for name in theta_headers)
-
-
-def _plot_shell_observations(
-    hf: pd.DataFrame,
-    theta_headers: Sequence[str],
-    out_path: Path,
-    shell_column: str = SHELL_COLUMN,
-    max_geometries: int = 12,
-) -> None:
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-    groups = list(hf.groupby(list(theta_headers), dropna=False, sort=True))
-    for _, group in groups[:max_geometries]:
-        group = group.sort_values(shell_column)
-        ax.plot(
-            group[shell_column],
-            group["y_raw"],
-            marker="o",
-            ms=2.5,
-            lw=1.1,
-            alpha=0.8,
-            label=_geometry_label(group.iloc[0], theta_headers),
-        )
-    ax.set_xlabel("Shell index")
-    ax.set_ylabel("High-fidelity shell occupation")
-    ax.set_title("High-fidelity shell distributions")
-    ax.grid(True, alpha=0.25)
-    if groups:
-        ax.legend(loc="best", fontsize=7, frameon=True)
-    if len(groups) > max_geometries:
-        ax.text(
-            0.01,
-            0.01,
-            f"Showing {max_geometries}/{len(groups)} detector geometries",
-            transform=ax.transAxes,
-            fontsize=8,
-        )
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=170)
-    plt.close(fig)
-
-
-def _plot_shell_mean_std(
-    grid_df: pd.DataFrame,
-    theta_headers: Sequence[str],
-    out_path: Path,
-    shell_column: str = SHELL_COLUMN,
-    max_geometries: int = 12,
-) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-    groups = list(grid_df.groupby(list(theta_headers), dropna=False, sort=True))
-    for _, group in groups[:max_geometries]:
-        group = group.sort_values(shell_column)
-        label = _geometry_label(group.iloc[0], theta_headers)
-        axes[0].plot(group[shell_column], group["mf_mean"], lw=1.2, label=label)
-        axes[1].plot(group[shell_column], group["mf_std"], lw=1.2, label=label)
-
-    axes[0].set_title("MF-GP high-fidelity mean by shell")
-    axes[0].set_ylabel("Predicted shell occupation")
-    axes[1].set_title("MF-GP high-fidelity uncertainty by shell")
-    axes[1].set_ylabel("Prediction standard deviation")
-    for axis in axes:
-        axis.set_xlabel("Shell index")
-        axis.grid(True, alpha=0.25)
-        if groups:
-            axis.legend(loc="best", fontsize=7, frameon=True)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=170)
-    plt.close(fig)
-
-
-def _plot_shell_validation_comparison(
-    validation_df: pd.DataFrame,
-    theta_headers: Sequence[str],
-    out_path: Path,
-    shell_column: str = SHELL_COLUMN,
-    max_geometries: int = 8,
-) -> None:
-    fig, ax = plt.subplots(1, 1, figsize=(11, 6))
-    groups = list(validation_df.groupby(list(theta_headers), dropna=False, sort=True))
-    for index, (_, group) in enumerate(groups[:max_geometries]):
-        group = group.sort_values(shell_column)
-        label = _geometry_label(group.iloc[0], theta_headers)
-        ax.plot(
-            group[shell_column],
-            group["y_raw"],
-            marker="o",
-            ms=2.5,
-            lw=1.0,
-            alpha=0.75,
-            label=f"truth: {label}",
-        )
-        ax.plot(
-            group[shell_column],
-            group["mf_mean"],
-            ls="--",
-            lw=1.2,
-            alpha=0.9,
-            label=f"MF-GP: {label}",
-        )
-    ax.set_xlabel("Shell index")
-    ax.set_ylabel("High-fidelity shell occupation")
-    ax.set_title("Validation shell distributions: truth vs MF-GP")
-    ax.grid(True, alpha=0.25)
-    if groups:
-        ax.legend(loc="best", fontsize=6.5, ncol=2, frameon=True)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=170)
-    plt.close(fig)
 
 
 def _scatter_grid(df: pd.DataFrame, x_col: str, y_col: str, z_col: str, n: int = 120) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1792,6 +1204,8 @@ def run_clean_mfgp(
     cnp_csv: Optional[str | Path] = None,
     validation_csv: Optional[str | Path] = None,
     iteration: int = 0,
+    lf_fidelity: int = 0,
+    hf_fidelity: int = 1,
     target_transform: str = "linear",
     log_epsilon: Optional[float] = None,
     grid_points_per_axis: int = 120,
@@ -1800,173 +1214,143 @@ def run_clean_mfgp(
     predict_chunk_size: int = 20000,
     verbose: bool = True,
 ) -> MFGPResult:
-    """Fit the distribution-aware MF-GP without changing the CNP file contract.
-
-    ``target_transform``, ``log_epsilon``, and ``predict_chunk_size`` remain in
-    the signature for notebook and CLI compatibility. Complete probability
-    distributions are represented with CLR+PCA, so only the linear mode is used.
-    """
-
-    del log_epsilon, predict_chunk_size
     t0 = time.time()
+    if verbose:
+        print("[stage] Loading runtime config...")
     runtime = load_runtime_config(config_path)
     runtime.out_dir_mfgp.mkdir(parents=True, exist_ok=True)
-
-    requested_transform = _target_transform_suffix(target_transform)
-    if requested_transform != "linear" and verbose:
-        print(
-            f"[warn] target_transform={requested_transform!r} is ignored for the "
-            "distribution model; CLR+PCA supplies the probability-space transform."
-        )
-    transform_mode = "linear"
+    transform_mode = _target_transform_suffix(target_transform)
     artifact_tag = f"{runtime.version}_{transform_mode}"
 
-    cnp_csv_path = (
-        Path(cnp_csv).expanduser().resolve()
-        if cnp_csv
-        else discover_cnp_output_csv(
-            runtime.out_dir_cnp,
-            runtime.version,
-            prefer_validation=prefer_validation_csv,
-        )
+    cnp_csv_path = Path(cnp_csv).expanduser().resolve() if cnp_csv else discover_cnp_output_csv(
+        runtime.out_dir_cnp,
+        runtime.version,
+        prefer_validation=prefer_validation_csv,
     )
     if not cnp_csv_path.exists():
-        raise FileNotFoundError(
-            _missing_csv_message(cnp_csv_path, runtime.out_dir_cnp, runtime.version)
-        )
-
+        raise FileNotFoundError(_missing_csv_message(cnp_csv_path, runtime.out_dir_cnp, runtime.version))
     if verbose:
         print(f"[stage] Using CNP CSV: {cnp_csv_path}")
-        print("[stage] Pivoting shell rows into one distribution per geometry/fidelity...")
 
-    data = load_geometry_distribution_data(
+    if verbose:
+        print("[stage] Loading LF/HF training rows...")
+    _, lf, hf = load_mfgp_training_data(
         cnp_csv_path,
-        theta_headers=runtime.theta_headers,
-        n_shells=runtime.n_shells,
+        x_cols=runtime.theta_headers,
         iteration=iteration,
-        require_both_fidelities=True,
-        epsilon=runtime.pca_epsilon,
+        lf_fidelity=lf_fidelity,
+        hf_fidelity=hf_fidelity,
     )
-    lf_mask = data.frame["fidelity"].astype(int).to_numpy() == FIDELITY_LF
-    hf_mask = data.frame["fidelity"].astype(int).to_numpy() == FIDELITY_HF
-    lf_frame = data.frame.loc[lf_mask, runtime.theta_headers].reset_index(drop=True)
-    hf_frame = data.frame.loc[hf_mask, runtime.theta_headers].reset_index(drop=True)
-    x_lf = data.theta[lf_mask]
-    x_hf = data.theta[hf_mask]
-    lf_distributions = data.cnp_distributions[lf_mask]
-    hf_distributions = data.raw_distributions[hf_mask]
 
-    if len(x_lf) < 1 or len(x_hf) < 1:
-        raise ValueError("Need at least one LF and one HF detector geometry")
-    if min(len(x_lf), len(x_hf)) < 3 and verbose:
+    x_lf = lf[runtime.theta_headers].to_numpy(dtype=float)
+    y_lf_raw = lf["y_cnp"].to_numpy(dtype=float)
+    x_hf = hf[runtime.theta_headers].to_numpy(dtype=float)
+    y_hf_raw = hf["y_raw"].to_numpy(dtype=float)
+    y_lf, y_hf, transform_eps, use_log_lf, use_log_hf = _transform_mfgp_targets(
+        y_lf_raw,
+        y_hf_raw,
+        target_transform=transform_mode,
+        eps=log_epsilon,
+    )
+    if verbose:
+        print(f"[data] n_lf={len(lf)} n_hf={len(hf)} x_dim={x_lf.shape[1]}")
         print(
-            "[warn] Fewer than three LF or HF geometries are available. "
-            "This is valid for an end-to-end smoke test, but it cannot establish "
-            "reliable geometry interpolation."
+            f"[data] target_transform={transform_mode} "
+            f"use_log_lf={use_log_lf} use_log_hf={use_log_hf} eps={transform_eps:.3e}"
         )
 
-    mean_lf_uncertainty = float(np.nanmean(data.cnp_uncertainties[lf_mask]))
-    alpha_lf = max(mean_lf_uncertainty**2, 1e-10)
-    alpha_hf = 1e-10
-    model = DistributionAutoregressiveMFGP(
-        pca_components=runtime.pca_components,
-        pca_epsilon=runtime.pca_epsilon,
-        random_state=random_state,
-        alpha_lf=alpha_lf,
-        alpha_hf=alpha_hf,
-    )
-    model.fit(
-        x_lf=x_lf,
-        distributions_lf=lf_distributions,
-        x_hf=x_hf,
-        distributions_hf=hf_distributions,
-        verbose=verbose,
-    )
+    # Noise levels reverted to old-notebook style.
+    # LF noise = mean(y_cnp_err)
+    # HF noise = std(y_raw) * 1e-8
+    lf_cnp_err_raw = lf["y_cnp_err"].to_numpy(dtype=float)
+    if use_log_lf:
+        lf_cnp_noise = float(np.nanmean(_log_sigma_from_linear(y_lf_raw, lf_cnp_err_raw, transform_eps)))
+    else:
+        lf_cnp_noise = float(np.nanmean(lf_cnp_err_raw))
+    hf_sim_noise = float(np.nanstd(y_hf))
+    alpha_lf = lf_cnp_noise
+    alpha_hf = hf_sim_noise * 1e-8
 
-    hf_prediction = model.predict_distribution(
-        x_hf,
-        mc_samples=runtime.distribution_mc_samples,
-        random_state=random_state,
-    )
-    training_metrics = _distribution_metrics(
-        hf_distributions,
-        hf_prediction["mean"],
-    )
+    alpha_lf = max(alpha_lf, 1e-10)
+    alpha_hf = max(alpha_hf, 1e-10)
+    if verbose:
+        print(
+            f"[data] lf_cnp_noise={lf_cnp_noise:.3e} hf_sim_noise={hf_sim_noise:.3e} "
+            f"alpha_lf={alpha_lf:.3e} alpha_hf={alpha_hf:.3e}"
+        )
 
-    grid_geometry = _geometry_grid_frame(
-        runtime,
-        x_lf,
-        x_hf,
-        grid_points_per_axis,
-    )
-    grid_prediction = model.predict_distribution(
-        grid_geometry[runtime.theta_headers].to_numpy(dtype=float),
-        mc_samples=runtime.distribution_mc_samples,
-        random_state=random_state + 1,
-    )
+    model = CleanAutoregressiveMFGP(random_state=random_state, alpha_lf=alpha_lf, alpha_hf=alpha_hf)
+    model.fit(x_lf=x_lf, y_lf=y_lf, x_hf=x_hf, y_hf=y_hf, verbose=verbose)
+
+    if verbose:
+        print("[stage] Predicting on HF observations...")
+    hf_pred_mean_parts: List[np.ndarray] = []
+    hf_pred_std_parts: List[np.ndarray] = []
+    n_hf = len(x_hf)
+    for i in range(0, n_hf, max(1, int(predict_chunk_size))):
+        j = min(n_hf, i + max(1, int(predict_chunk_size)))
+        mu_hf, std_hf, _, _ = model.predict(x_hf[i:j])
+        hf_pred_mean_parts.append(mu_hf)
+        hf_pred_std_parts.append(std_hf)
+        if verbose:
+            print(f"[progress] HF predict {j}/{n_hf}")
+    hf_pred_mean = np.concatenate(hf_pred_mean_parts, axis=0)
+    hf_pred_std = np.concatenate(hf_pred_std_parts, axis=0)
+
+    rmse = float(np.sqrt(mean_squared_error(y_hf, hf_pred_mean)))
+    mae = float(mean_absolute_error(y_hf, hf_pred_mean))
+    r2 = float(r2_score(y_hf, hf_pred_mean))
+
+    # Grid prediction
+    if len(runtime.theta_min) >= 2 and len(runtime.theta_max) >= 2:
+        grid_xy = _grid_from_bounds(runtime.theta_min, runtime.theta_max, n=grid_points_per_axis)
+    else:
+        x0, x1 = runtime.theta_headers
+        theta_min = [float(min(lf[x0].min(), hf[x0].min())), float(min(lf[x1].min(), hf[x1].min()))]
+        theta_max = [float(max(lf[x0].max(), hf[x0].max())), float(max(lf[x1].max(), hf[x1].max()))]
+        grid_xy = _grid_from_bounds(theta_min, theta_max, n=grid_points_per_axis)
+
+    if verbose:
+        print(f"[stage] Predicting on grid ({len(grid_xy)} points)...")
+    gm_parts: List[np.ndarray] = []
+    gs_parts: List[np.ndarray] = []
+    glm_parts: List[np.ndarray] = []
+    gls_parts: List[np.ndarray] = []
+    n_grid = len(grid_xy)
+    for i in range(0, n_grid, max(1, int(predict_chunk_size))):
+        j = min(n_grid, i + max(1, int(predict_chunk_size)))
+        gm, gs, glm, gls = model.predict(grid_xy[i:j])
+        gm_parts.append(gm)
+        gs_parts.append(gs)
+        glm_parts.append(glm)
+        gls_parts.append(gls)
+        if verbose:
+            print(f"[progress] Grid predict {j}/{n_grid}")
+    grid_mean = np.concatenate(gm_parts, axis=0)
+    grid_std = np.concatenate(gs_parts, axis=0)
+    grid_lf_mean = np.concatenate(glm_parts, axis=0)
+    grid_lf_std = np.concatenate(gls_parts, axis=0)
+
+    df_hf = hf.copy()
+    df_hf["y_raw_original"] = y_hf_raw
+    df_hf["y_raw"] = y_hf
+    df_hf["target_transform"] = transform_mode
+    df_hf["target_transform_eps"] = transform_eps
+    df_hf["mf_mean"] = hf_pred_mean
+    df_hf["mf_std"] = hf_pred_std
+
+    df_grid = pd.DataFrame(grid_xy, columns=runtime.theta_headers)
+    df_grid["target_transform"] = transform_mode
+    df_grid["target_transform_eps"] = transform_eps
+    df_grid["mf_mean"] = grid_mean
+    df_grid["mf_std"] = grid_std
+    df_grid["lf_mean"] = grid_lf_mean
+    df_grid["lf_std"] = grid_lf_std
 
     pred_csv = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_predictions_iter{iteration}.csv"
     grid_csv = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_grid_iter{iteration}.csv"
-    _prediction_rows(
-        hf_frame,
-        hf_prediction,
-        iteration=iteration,
-        fidelity=FIDELITY_HF,
-        truth=hf_distributions,
-    ).to_csv(pred_csv, index=False)
-    _prediction_rows(
-        grid_geometry,
-        grid_prediction,
-        iteration=iteration,
-        fidelity=FIDELITY_HF,
-        truth=None,
-    ).to_csv(grid_csv, index=False)
-
-    validation_metrics: Optional[dict[str, float]] = None
-    validation_prediction: Optional[dict[str, np.ndarray]] = None
-    validation_frame: Optional[pd.DataFrame] = None
-    validation_truth: Optional[np.ndarray] = None
-    val_csv = (
-        Path(validation_csv).expanduser().resolve()
-        if validation_csv is not None
-        else _resolve_optional_validation_csv(runtime)
-    )
-    if val_csv is not None and val_csv.exists():
-        validation_data = load_geometry_distribution_data(
-            val_csv,
-            theta_headers=runtime.theta_headers,
-            n_shells=runtime.n_shells,
-            iteration=iteration,
-            require_both_fidelities=False,
-            epsilon=runtime.pca_epsilon,
-        )
-        validation_fidelities = sorted(
-            validation_data.frame["fidelity"].astype(int).unique().tolist()
-        )
-        if validation_fidelities != [FIDELITY_HF]:
-            raise ValueError(
-                "Validation CNP CSV must contain only fidelity=1 HF data; "
-                f"found {validation_fidelities}"
-            )
-        validation_frame = validation_data.frame[runtime.theta_headers].reset_index(drop=True)
-        validation_truth = validation_data.raw_distributions
-        validation_prediction = model.predict_distribution(
-            validation_data.theta,
-            mc_samples=runtime.distribution_mc_samples,
-            random_state=random_state + 2,
-        )
-        validation_metrics = _distribution_metrics(
-            validation_truth,
-            validation_prediction["mean"],
-        )
-    elif verbose:
-        print("[info] No validation CNP CSV supplied; skipping held-out diagnostics.")
-
-    pca = model.compressor.pca
-    if pca is None:
-        raise RuntimeError("PCA compressor was not fitted")
-    explained = np.nan_to_num(pca.explained_variance_ratio_, nan=0.0)
-    rho_values = [float(component.rho) for component in model.models]
+    df_hf.to_csv(pred_csv, index=False)
+    df_grid.to_csv(grid_csv, index=False)
 
     model_json = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_model_iter{iteration}.json"
     model_json.write_text(
@@ -1976,24 +1360,18 @@ def run_clean_mfgp(
                 "config_path": str(runtime.config_path),
                 "cnp_csv": str(cnp_csv_path),
                 "iteration": int(iteration),
-                "fidelity_definition": {"0": "low fidelity", "1": "high fidelity"},
-                "fidelity_source": "file_manifest.csv via CNP CSV",
+                "lf_fidelity": int(lf_fidelity),
+                "hf_fidelity": int(hf_fidelity),
                 "theta_headers": runtime.theta_headers,
-                "n_shells": int(runtime.n_shells),
-                "internal_row_structure": (
-                    "one row per detector geometry and fidelity with ordered shell-probability lists"
-                ),
-                "distribution_representation": "centered-log-ratio PCA",
-                "n_pca_components": int(pca.n_components_),
-                "pca_explained_variance_ratio": explained.tolist(),
-                "pca_cumulative_explained_variance": float(explained.sum()),
-                "rho_by_component": rho_values,
-                "n_lf_geometries": int(len(x_lf)),
-                "n_hf_geometries": int(len(x_hf)),
+                "target_transform": transform_mode,
+                "target_transform_eps": transform_eps,
+                "use_log_lf": bool(use_log_lf),
+                "use_log_hf": bool(use_log_hf),
+                "rho": float(model.rho),
                 "alpha_lf": float(alpha_lf),
                 "alpha_hf": float(alpha_hf),
-                "distribution_mc_samples": int(runtime.distribution_mc_samples),
-                "serialization": "metadata only; no cloudpickle dependency",
+                "n_lf": int(len(lf)),
+                "n_hf": int(len(hf)),
             },
             indent=2,
         )
@@ -2003,64 +1381,171 @@ def run_clean_mfgp(
     metrics_json.write_text(
         json.dumps(
             {
-                "hf_training": training_metrics,
-                "hf_validation": validation_metrics,
-                "n_lf_geometries": int(len(x_lf)),
-                "n_hf_geometries": int(len(x_hf)),
-                "n_pca_components": int(pca.n_components_),
-                "rho_by_component": rho_values,
+                "rmse_hf": rmse,
+                "mae_hf": mae,
+                "r2_hf": r2,
+                "n_lf": int(len(lf)),
+                "n_hf": int(len(hf)),
+                "rho": float(model.rho),
+                "target_transform": transform_mode,
+                "target_transform_eps": transform_eps,
             },
             indent=2,
         )
     )
 
     data_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_hf_observations_iter{iteration}.png"
+    parity_plot = None
     mean_std_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_mean_std_iter{iteration}.png"
-    _plot_distribution_observations(
-        hf_frame,
-        hf_distributions,
-        data_plot,
-        "HF observed shell distributions",
-    )
-    _plot_distribution_predictions(
-        hf_frame,
-        hf_prediction,
-        mean_std_plot,
-        "HF training distributions: MF-GP reconstruction",
-        truth=hf_distributions,
-    )
+    mean_std_plot_3d_html = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_mean_std_3d_interactive_iter{iteration}.html"
+    residual_plot = None
 
+    _plot_hf_observation_map(hf, runtime.theta_headers, data_plot)
+    # Training-side parity plot intentionally omitted to reduce redundant outputs.
+    if runtime.sim_type == "shell":
+        _plot_mean_std_linear(
+            grid_xy,
+            grid_mean,
+            grid_std,
+            runtime.theta_headers,
+            hf_points=x_hf,
+            out_path=mean_std_plot,
+        )
+    else:
+        _plot_mean_std_heatmaps(
+            grid_xy,
+            grid_mean,
+            grid_std,
+            runtime.theta_headers,
+            hf_points=x_hf,
+            out_path=mean_std_plot,
+        )
+    interactive_3d_ok = _write_interactive_mean_std_surfaces_3d_html(
+        grid_xy,
+        grid_mean,
+        grid_std,
+        runtime.theta_headers,
+        hf_points=x_hf,
+        hf_mean_values=hf_pred_mean,
+        hf_std_values=hf_pred_std,
+        out_path=mean_std_plot_3d_html,
+    )
+    if not interactive_3d_ok:
+        mean_std_plot_3d_html = None
+
+    theta_group_plot_dir: Optional[Path] = None
+    across_theta_plot: Optional[Path] = None
+    across_theta_zoom_plot: Optional[Path] = None
     coverage_plot: Optional[Path] = None
     validation_parity_plot: Optional[Path] = None
+    train_across_theta_linear_plot: Optional[Path] = None
+    train_across_theta_log_linear_sigma_plot: Optional[Path] = None
+    train_across_theta_log_log_sigma_plot: Optional[Path] = None
     validation_across_theta_linear_plot: Optional[Path] = None
-    if validation_prediction is not None and validation_frame is not None and validation_truth is not None:
-        validation_across_theta_linear_plot = (
-            runtime.out_dir_mfgp
-            / f"mfgp_{artifact_tag}_validation_shell_distributions_iter{iteration}.png"
-        )
-        _plot_distribution_predictions(
-            validation_frame,
-            validation_prediction,
-            validation_across_theta_linear_plot,
-            "Held-out HF shell distributions",
-            truth=validation_truth,
-        )
-        coverage_plot = validation_across_theta_linear_plot
-        validation_parity_plot = validation_across_theta_linear_plot
+    validation_across_theta_log_linear_sigma_plot: Optional[Path] = None
+    validation_across_theta_log_log_sigma_plot: Optional[Path] = None
+    train_parity_linear_plot: Optional[Path] = None
+    train_parity_log_plot: Optional[Path] = None
+    validation_parity_linear_plot: Optional[Path] = None
+    validation_parity_log_plot: Optional[Path] = None
+
+    # 3σ and parity diagnostics are intentionally produced only for held-out
+    # validation HF data. Training HF predictions remain available in pred_csv.
+
+    # Additional old-notebook-style validation plots.
+    val_csv = Path(validation_csv).expanduser().resolve() if validation_csv is not None else _resolve_optional_validation_csv(runtime)
+    if val_csv is not None:
+        if not val_csv.exists():
+            if verbose:
+                print(_missing_csv_message(val_csv, runtime.out_dir_cnp, runtime.version))
+                print("[warn] Explicit validation_csv does not exist; skipping extra validation plots.")
+            val_csv = None
+    if val_csv is not None:
+        try:
+            if verbose:
+                print(f"[stage] Loading validation CSV for extra plots: {val_csv}")
+            df_val = pd.read_csv(val_csv)
+            need = set([*runtime.theta_headers, "iteration", "y_raw"])
+            if need.issubset(df_val.columns):
+                df_val = df_val[df_val["iteration"].astype(int) == int(iteration)].copy()
+                if len(df_val):
+                    df_val["y_raw_original"] = df_val["y_raw"].to_numpy(dtype=float)
+                    df_val["y_raw"] = _transform_series_for_mode(
+                        df_val["y_raw"].to_numpy(dtype=float),
+                        use_log=use_log_hf,
+                        eps=transform_eps,
+                    )
+                    theta_group_plot_dir = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_theta_group_plots_iter{iteration}"
+                    if use_log_hf:
+                        # Per-theta helper is a log-y visualization; skip it when
+                        # the target itself is already log-transformed to avoid double logging.
+                        theta_group_plot_dir = None
+                    else:
+                        n_groups = _plot_theta_group_uncertainty_bands(
+                            df_val=df_val,
+                            theta_headers=runtime.theta_headers,
+                            model=model,
+                            out_dir=theta_group_plot_dir,
+                            band_mode="linear_sigma",
+                        )
+                        _plot_theta_group_uncertainty_bands(
+                            df_val=df_val,
+                            theta_headers=runtime.theta_headers,
+                            model=model,
+                            out_dir=theta_group_plot_dir,
+                            band_mode="log_sigma",
+                        )
+                        if verbose:
+                            print(f"[done] Generated theta-group uncertainty plots: {2 * n_groups}")
+
+                    val_agg = _aggregate_theta_predictions_from_model(df_val, runtime.theta_headers, model)
+                    validation_across_theta_linear_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_validation_across_thetas_linear_iter{iteration}.png"
+
+                    y_true_v, y_pred_v, y_std_v = _plot_across_theta_series(
+                        val_agg,
+                        validation_across_theta_linear_plot,
+                        f"Validation HF Thetas: Mean Target vs MF-GP Prediction ({transform_mode}, {'Log10 Target Scale' if use_log_hf else 'Linear Scale'})",
+                        y_mode="linear",
+                        band_mode="linear_sigma",
+                    )
+                    across_theta_plot = validation_across_theta_linear_plot
+                    across_theta_zoom_plot = None
+
+                    if transform_mode in {"linear", "log_lf"}:
+                        validation_across_theta_log_linear_sigma_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_validation_across_thetas_log_linear_sigma_iter{iteration}.png"
+                        _plot_across_theta_series(
+                            val_agg,
+                            validation_across_theta_log_linear_sigma_plot,
+                            f"Validation HF Thetas: Mean Target vs MF-GP Prediction ({transform_mode}, Log y, Linear-σ Bands)",
+                            y_mode="log",
+                            band_mode="linear_sigma",
+                        )
+                        across_theta_zoom_plot = validation_across_theta_log_linear_sigma_plot
+
+                    coverage_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_coverage_summary_iter{iteration}.png"
+                    _plot_coverage_summary(y_true_v, y_pred_v, y_std_v, coverage_plot)
+
+                    validation_parity_linear_plot = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_validation_parity_linear_iter{iteration}.png"
+                    _plot_parity_linear(
+                        y_true_v,
+                        y_pred_v,
+                        y_std_v,
+                        validation_parity_linear_plot,
+                        f"Validation HF Parity Plot ({transform_mode}, {'Log10 Target Scale' if use_log_hf else 'Linear Scale'})",
+                    )
+                    validation_parity_plot = validation_parity_linear_plot
+            elif verbose:
+                print("[warn] Validation CSV missing required columns for extra plots; skipping.")
+        except Exception as exc:
+            if verbose:
+                print(f"[warn] Could not generate validation extra plots: {exc}")
+    elif verbose:
+        print("[info] path_to_files_validation not found; skipping extra validation plots.")
 
     elapsed = time.time() - t0
     if verbose:
-        print(
-            f"[done] Distribution MF-GP complete | LF geometries={len(x_lf)} | "
-            f"HF geometries={len(x_hf)} | shells={runtime.n_shells} | "
-            f"PCA components={pca.n_components_}"
-        )
-        print(
-            "[done] HF distribution metrics: "
-            f"RMSE={training_metrics['mean_shell_rmse']:.6g}, "
-            f"TV={training_metrics['mean_total_variation']:.6g}, "
-            f"JS={training_metrics['mean_jensen_shannon']:.6g}"
-        )
+        print(f"[done] MFGP complete | version={runtime.version} | n_lf={len(lf)} n_hf={len(hf)}")
+        print(f"[done] HF metrics: RMSE={rmse:.6f}, MAE={mae:.6f}, R2={r2:.6f}, rho={float(model.rho):.6f}")
         print(f"[done] Outputs -> {runtime.out_dir_mfgp}")
         print(f"[done] Elapsed: {elapsed:.1f}s")
 
@@ -2071,26 +1556,27 @@ def run_clean_mfgp(
         prediction_csv=pred_csv,
         grid_csv=grid_csv,
         data_plot=data_plot,
-        parity_plot=None,
+        parity_plot=parity_plot,
         mean_std_plot=mean_std_plot,
-        mean_std_plot_3d_html=None,
-        residual_plot=None,
-        theta_group_plot_dir=None,
-        across_theta_plot=validation_across_theta_linear_plot,
-        across_theta_zoom_plot=None,
+        mean_std_plot_3d_html=mean_std_plot_3d_html,
+        residual_plot=residual_plot,
+        theta_group_plot_dir=theta_group_plot_dir,
+        across_theta_plot=across_theta_plot,
+        across_theta_zoom_plot=across_theta_zoom_plot,
         coverage_plot=coverage_plot,
         validation_parity_plot=validation_parity_plot,
-        train_across_theta_linear_plot=None,
-        train_across_theta_log_linear_sigma_plot=None,
-        train_across_theta_log_log_sigma_plot=None,
+        train_across_theta_linear_plot=train_across_theta_linear_plot,
+        train_across_theta_log_linear_sigma_plot=train_across_theta_log_linear_sigma_plot,
+        train_across_theta_log_log_sigma_plot=train_across_theta_log_log_sigma_plot,
         validation_across_theta_linear_plot=validation_across_theta_linear_plot,
-        validation_across_theta_log_linear_sigma_plot=None,
-        validation_across_theta_log_log_sigma_plot=None,
-        train_parity_linear_plot=None,
-        train_parity_log_plot=None,
-        validation_parity_linear_plot=validation_parity_plot,
-        validation_parity_log_plot=None,
+        validation_across_theta_log_linear_sigma_plot=validation_across_theta_log_linear_sigma_plot,
+        validation_across_theta_log_log_sigma_plot=validation_across_theta_log_log_sigma_plot,
+        train_parity_linear_plot=train_parity_linear_plot,
+        train_parity_log_plot=train_parity_log_plot,
+        validation_parity_linear_plot=validation_parity_linear_plot,
+        validation_parity_log_plot=validation_parity_log_plot,
     )
+
 
 def run_mfgp_transform_suite(
     config_path: str | Path,
@@ -2098,49 +1584,53 @@ def run_mfgp_transform_suite(
     validation_csv: Optional[str | Path] = None,
     transforms: Sequence[str] = ("linear", "log_hf", "log_lf", "log_both"),
     iteration: int = 0,
+    lf_fidelity: int = 0,
+    hf_fidelity: int = 1,
     log_epsilon: Optional[float] = None,
     grid_points_per_axis: int = 120,
     random_state: int = 42,
     predict_chunk_size: int = 20000,
     verbose: bool = True,
 ) -> Dict[str, MFGPResult]:
-    """Compatibility wrapper; the distribution model has one CLR+PCA mode."""
-    del transforms
-    if verbose:
-        print(
-            "[info] --all-transforms is retained for compatibility, but the "
-            "distribution MF-GP runs once using CLR+PCA."
+    results: Dict[str, MFGPResult] = {}
+    for transform in transforms:
+        mode = _target_transform_suffix(transform)
+        if verbose:
+            print(f"\n=== Running MF-GP target transform: {mode} ===")
+        results[mode] = run_clean_mfgp(
+            config_path=config_path,
+            cnp_csv=cnp_csv,
+            validation_csv=validation_csv,
+            iteration=iteration,
+            lf_fidelity=lf_fidelity,
+            hf_fidelity=hf_fidelity,
+            target_transform=mode,
+            log_epsilon=log_epsilon,
+            grid_points_per_axis=grid_points_per_axis,
+            random_state=random_state,
+            predict_chunk_size=predict_chunk_size,
+            verbose=verbose,
         )
-    result = run_clean_mfgp(
-        config_path=config_path,
-        cnp_csv=cnp_csv,
-        validation_csv=validation_csv,
-        iteration=iteration,
-        target_transform="linear",
-        log_epsilon=log_epsilon,
-        grid_points_per_axis=grid_points_per_axis,
-        random_state=random_state,
-        predict_chunk_size=predict_chunk_size,
-        verbose=verbose,
-    )
-    return {"linear": result}
+    return results
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Distribution-aware multi-fidelity GP pipeline for CNP shell probabilities")
+    p = argparse.ArgumentParser(description="Clean multi-fidelity GP pipeline (no resum helpers)")
     p.add_argument("--config", type=str, default=str(_default_config_path()), help="Path to XLZD settings.yaml")
     p.add_argument("--cnp-csv", type=str, default=None, help="Optional explicit CNP output CSV")
     p.add_argument("--validation-csv", type=str, default=None, help="Optional explicit validation CSV for extra plots")
     p.add_argument("--iteration", type=int, default=0, help="Iteration value to filter")
+    p.add_argument("--lf-fidelity", type=int, default=0, help="LF fidelity id")
+    p.add_argument("--hf-fidelity", type=int, default=1, help="HF fidelity id")
     p.add_argument(
         "--target-transform",
         type=str,
         default="linear",
         choices=["linear", "log_hf", "log_lf", "log_both"],
-        help="Compatibility option. The distribution model always uses CLR+PCA internally.",
+        help="Target scale for MF-GP: linear, log HF only, log LF only, or log both",
     )
     p.add_argument("--log-epsilon", type=float, default=None, help="Optional explicit epsilon for log target transforms")
-    p.add_argument("--all-transforms", action="store_true", help="Compatibility option; runs the CLR+PCA distribution model once")
+    p.add_argument("--all-transforms", action="store_true", help="Run all four MF-GP target-transform experiments")
     p.add_argument("--grid-points", type=int, default=120, help="Grid points per axis")
     p.add_argument("--predict-chunk-size", type=int, default=20000, help="Chunk size for prediction progress")
     p.add_argument("--random-state", type=int, default=42, help="Random seed")
@@ -2161,6 +1651,8 @@ def main() -> None:
             cnp_csv=args.cnp_csv,
             validation_csv=args.validation_csv,
             iteration=args.iteration,
+            lf_fidelity=args.lf_fidelity,
+            hf_fidelity=args.hf_fidelity,
             log_epsilon=args.log_epsilon,
             grid_points_per_axis=args.grid_points,
             random_state=args.random_state,
@@ -2174,6 +1666,8 @@ def main() -> None:
         cnp_csv=args.cnp_csv,
         validation_csv=args.validation_csv,
         iteration=args.iteration,
+        lf_fidelity=args.lf_fidelity,
+        hf_fidelity=args.hf_fidelity,
         target_transform=args.target_transform,
         log_epsilon=args.log_epsilon,
         grid_points_per_axis=args.grid_points,

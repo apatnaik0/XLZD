@@ -1,16 +1,17 @@
-# CNP–MF-GP Pipeline - Updated July 14th, 2026
+# CNP–MF-GP Pipeline
 
 This folder contains the active XLZD event-shell modeling workflow.
 
 The pipeline combines:
 
-1. **Geometry-aware data preparation**
-2. **Event-level Conditional Neural Process classification**
-3. **Aggregation of predicted shell probabilities**
-4. **Two-level autoregressive multi-fidelity Gaussian-process modeling**
-5. **Optional emulation and visualization**
+1. geometry-aware event preparation;
+2. event-level Conditional Neural Process classification;
+3. aggregation into one shell-probability distribution per geometry and fidelity;
+4. centered-log-ratio PCA of the complete shell distribution;
+5. autoregressive multi-fidelity Gaussian processes over the PCA coefficients;
+6. reconstruction of valid high-fidelity shell distributions.
 
-The intended use is to learn event distributions across multiple cylindrical detector geometries while combining inexpensive low-fidelity simulations with more expensive high-fidelity simulations.
+The intended use is to learn how complete event-position distributions change across cylindrical detector geometries while combining inexpensive low-fidelity simulations with more expensive high-fidelity simulations.
 
 ---
 
@@ -32,99 +33,29 @@ cnp_mfgp/
 └── visualize.py
 ```
 
-### `additional_experiments/`
+### Primary files
 
-Experimental variations that are still relevant to the current codebase but are not part of the default run path.
+`prepare_cnp_mfgp_data.py`
+: Reads `file_manifest.csv`, builds shell labels, preserves the manifest fidelity for every event, splits only high-fidelity events into training and validation data, and writes categorical HDF5 blocks.
 
-Examples may include:
+`cnp_clean_pipeline.py`
+: Defines the event-level CNP, training loop, checkpoint format, MC-dropout prediction, and long-form shell-distribution CSV exports.
 
-- alternate training settings;
-- loss or weighting tests;
-- alternate feature definitions;
-- target-transform comparisons;
-- augmentation studies;
-- one-off validation analyses.
+`mfgp_clean_pipeline.py`
+: Recommended MF-GP implementation. It treats the 100 shell probabilities as one correlated probability distribution, compresses the distribution with centered-log-ratio PCA, fits one autoregressive MF-GP per latent coefficient, and reconstructs normalized shell distributions.
 
-Stable functionality should eventually move into the main scripts or `common/`. Retired experiments should move to the repository-level `archive/`.
+`emulation.py`
+: Generates synthetic source positions and passes them through a trained CNP.
 
-### `config/`
-
-Active JSON and YAML configuration files used by the pipeline.
-
-Typical files include:
-
-```text
-pipeline_config.json
-settings_shell_minibatch.yaml
-settings_shell_validation.yaml
-```
-
-The preprocessing script reads JSON. The CNP and MF-GP scripts read YAML.
-
-### `examples/`
-
-Small runnable examples and reference scripts.
-
-Use this folder for minimal demonstrations of:
-
-- preparing a dataset;
-- loading a trained model;
-- running prediction;
-- generating emulated source points;
-- calling visualization utilities.
-
-### `notebooks/`
-
-Interactive workflows for configuring, running, inspecting, and comparing experiments.
-
-Notebooks should call the pipeline functions rather than duplicating their implementations.
-
-### `outputs/`
-
-Generated model artifacts and diagnostics.
-
-A useful organization is:
-
-```text
-outputs/
-├── cnp/
-├── mfgp/
-├── emulation/
-└── figures/
-```
-
-Large generated files should normally not be committed.
-
-### `__init__.py`
-
-Marks `cnp_mfgp` as an importable Python package.
-
-### `prepare_cnp_mfgp_data.py`
-
-Converts raw event files into event-level categorical HDF5 blocks for CNP training and prediction.
-
-### `cnp_clean_pipeline.py`
-
-Defines the HDF5 event loader, deterministic CNP, training loop, checkpoint format, MC-dropout prediction, and CSV exports.
-
-### `mfgp_clean_pipeline.py`
-
-Fits the two-level autoregressive MF-GP to aggregated CNP outputs and creates geometry-level predictions and diagnostics.
-
-### `emulation.py`
-
-Generates synthetic source positions, converts them to the CNP HDF5 format, and runs a trained CNP without treating dummy labels as physical truth.
-
-### `visualize.py`
-
-Reusable plotting functions for raw event positions, shell occupancy, and CNP prediction distributions.
+`visualize.py`
+: Reusable plotting helpers for raw events, shell occupancy, and predicted distributions.
 
 ---
 
 # Pipeline overview
 
 ```text
-Raw event CSVs + file_manifest.csv
+Raw event files + file_manifest.csv
                  │
                  ▼
      prepare_cnp_mfgp_data.py
@@ -136,74 +67,85 @@ Raw event CSVs + file_manifest.csv
                  ▼
         cnp_clean_pipeline.py
                  │
-                 ├── model checkpoint
+                 ├── CNP checkpoint
                  ├── training diagnostics
                  ├── best shell per event
-                 └── aggregated shell probabilities
+                 └── long-form shell probabilities
                               │
                               ▼
-                 mfgp_clean_pipeline.py
+          mfgp_clean_pipeline.py
                               │
-                              ├── fitted model metadata
-                              ├── geometry-grid predictions
-                              ├── metrics
-                              └── diagnostic plots
+                              ├── one LF distribution per geometry
+                              ├── one HF distribution per geometry
+                              ├── CLR transformation
+                              ├── PCA coefficients
+                              ├── one MF-GP per coefficient
+                              └── reconstructed HF distributions
 ```
 
-`emulation.py` and `visualize.py` support the workflow but are not required for standard training.
+The central statistical unit of the MF-GP is now **one detector geometry with one complete shell distribution**, not one shell bin treated as an independent geometry sample.
 
 ---
 
-# Model definition
+# Model definitions
 
 ## Detector geometry: theta
 
-The default global detector features are:
+The default detector features are:
 
 ```text
 theta = [detector_R, detector_Z]
 ```
 
-`detector_R` is the detector radial extent.
-
-`detector_Z` is the maximum absolute distance from the detector center in z, normally the detector half-height.
-
-The values are read from `file_manifest.csv` for each input file.
+- `detector_R` is the detector radial extent.
+- `detector_Z` is the maximum absolute centered-z extent, normally the detector half-height.
+- Both values come from `file_manifest.csv`.
 
 ## Event/source features: phi
 
-The default event-level source features are:
+The default event-level CNP features are:
 
 ```text
 phi = [s_r, s_z_from_center]
 ```
 
-where:
+with:
 
 ```text
 s_r = sqrt(sx^2 + sy^2)
 s_z_from_center = abs(sz - z_center)
 ```
 
-## Target
+## CNP target
 
-The target is:
-
-```text
-target_shell
-```
-
-This is a zero-based categorical class:
+The event-level target is the zero-based shell class:
 
 ```text
-0, 1, ..., n_shells - 1
+target_shell = 0, 1, ..., n_shells - 1
 ```
 
-Exported human-readable shell indices are normally one-based:
+Human-readable exported shell indices are one-based:
 
 ```text
-1, 2, ..., n_shells
+shell_index = 1, 2, ..., n_shells
 ```
+
+## MF-GP target
+
+For every geometry and fidelity, the CNP output is aggregated into:
+
+```text
+p(theta, fidelity) = [p_1, p_2, ..., p_n_shells]
+```
+
+where:
+
+```text
+p_i >= 0
+sum_i p_i = 1
+```
+
+For the default 100-shell configuration, one geometry has one 100-dimensional output vector.
 
 ---
 
@@ -215,7 +157,6 @@ For shell level `i`:
 
 ```text
 fraction_i = i / n_shells
-
 R_i = R_max * fraction_i^scale_power
 Z_i = Z_max * fraction_i^scale_power
 ```
@@ -228,16 +169,16 @@ With:
 scale_power = 1/3
 ```
 
-the radius and axial extent scale together so that the enclosed cylindrical volume increases linearly with shell number. The resulting shells therefore have equal nominal volume.
+radius and centered-z extent scale together so that enclosed cylindrical volume increases linearly with shell number. The shells therefore have equal nominal volume.
 
-The shell assignment is based on the event endpoint:
+The shell target is determined from the event endpoint:
 
 ```text
 r = sqrt(x^2 + y^2)
 z_from_center = abs(z - z_center)
 ```
 
-The CNP inputs use source-position features, while the target shell is determined from the endpoint position.
+The CNP input uses source-position features, while the target shell uses the endpoint position.
 
 ---
 
@@ -254,17 +195,11 @@ Input event files are expected to contain:
 | `ETPC` | Energy deposited in the TPC |
 | `x`, `y`, `z` | Event endpoint coordinates |
 
-The shared loader normalizes several common naming variations. A global event ID is preserved or generated.
+The shared loader may normalize common naming variations. An event ID is preserved or generated.
 
 ## File manifest
 
-Place a manifest inside the configured raw-data directory.
-
-Default name:
-
-```text
-file_manifest.csv
-```
+Place `file_manifest.csv` inside the configured raw-data directory.
 
 Required columns:
 
@@ -272,9 +207,9 @@ Required columns:
 |---|---|
 | `filename` | Raw event filename, including extension |
 | `R` | Detector radius |
-| `Z` | Detector centered-z extent, normally half-height |
-| `z_center` | Center of the detector in the raw z-coordinate system |
-| `fidelity` | Fidelity metadata associated with the source file |
+| `Z` | Detector centered-z extent |
+| `z_center` | Detector center in the raw z-coordinate system |
+| `fidelity` | Exact numeric fidelity: `0` or `1` |
 
 Example:
 
@@ -286,9 +221,16 @@ geometry_B_lf.csv,1600,2100,2100,0
 geometry_B_hf.csv,1600,2100,2100,1
 ```
 
-`R`, `Z`, and `z_center` should be supplied explicitly. They should not be inferred from event coverage because an individual source component may not span the complete detector.
+Fidelity has one definition throughout the pipeline:
 
-The manifest fidelity is retained as source metadata. The later LF/HF pool split is performed after events from all manifest files are combined.
+```text
+0 = low fidelity
+1 = high fidelity
+```
+
+Fidelity comes only from `file_manifest.csv`. It is not assigned from directory names, pool fractions, YAML lists, filenames, or numerical ordering.
+
+`R`, `Z`, and `z_center` should be supplied explicitly. They should not be inferred from event coverage because one source component may not span the complete detector.
 
 ## Preprocessing configuration
 
@@ -301,10 +243,8 @@ Example `config/pipeline_config.json`:
     "max_rows_per_file": null
   },
   "split": {
-    "lf_pool_fraction": 0.2,
-    "hf_pool_fraction": 0.4,
-    "random_seed": 42,
-    "stratify_by_component": false
+    "validation_fraction": 0.4,
+    "random_seed": 42
   },
   "sampling": {
     "lf_block_size": 20000,
@@ -324,11 +264,25 @@ Example `config/pipeline_config.json`:
 }
 ```
 
+`validation_fraction` applies only to manifest-defined high-fidelity events.
+
+For example:
+
+```text
+validation_fraction = 0.4
+```
+
+means:
+
+- all fidelity-0 events remain in LF training;
+- 60% of fidelity-1 events go to HF training;
+- 40% of fidelity-1 events go to HF validation.
+
+There are no LF/HF pool fractions and preprocessing never changes an event's fidelity.
+
 `validation_block_size: null` uses the HF block size.
 
 `max_rows_per_file: null` loads the complete file.
-
-The geometry in each manifest row replaces any global `R_max`, `Z_max`, or `z_center` values in the shell configuration.
 
 ## Run preprocessing
 
@@ -340,29 +294,25 @@ python cnp_mfgp/prepare_cnp_mfgp_data.py \
   --manifest file_manifest.csv
 ```
 
-Always pass the configuration path explicitly.
-
-> **Important:** the preprocessing script deletes the complete configured `output_dir` before rebuilding it. Use a dedicated or versioned dataset directory.
+The preparation script deletes the configured output directory before rebuilding it. Use a dedicated or versioned dataset path.
 
 ## What preprocessing does
 
-The script:
-
-1. Loads every file in the manifest.
+1. Loads each manifest row and validates fidelity as exactly `0` or `1`.
 2. Adds centered source and endpoint coordinates.
-3. Stores each file's detector geometry on every event.
-4. Builds the shell table for that geometry.
-5. Assigns one zero-based shell target to every valid event.
-6. Concatenates labeled events across geometries.
-7. Shuffles and creates disjoint LF, HF, and validation pools.
-8. Divides each pool into near-equal blocks.
-9. Writes categorical HDF5 blocks.
-10. Writes pool tables, shell tables, and an HDF5-file manifest.
+3. Stores detector geometry and fidelity on every event.
+4. Builds the shell table for each geometry.
+5. Assigns one zero-based shell class to each valid event.
+6. Combines labeled events across files.
+7. Sends every fidelity-0 event to LF training.
+8. Splits only fidelity-1 events into HF training and HF validation.
+9. Divides each dataset into event blocks.
+10. Writes categorical HDF5 blocks and summary tables.
 
 ## Prepared directory structure
 
 ```text
-<configured output_dir>/
+<output_dir>/
 ├── training/
 │   ├── lf/
 │   │   └── lf_block####_event_classes.h5
@@ -379,8 +329,6 @@ The script:
 └── event_class_manifest.csv
 ```
 
-Pool tables use Parquet instead of CSV when `output_format` is set to `parquet`.
-
 ## HDF5 contract
 
 Each event block contains:
@@ -395,22 +343,21 @@ target_headers
 meta/
 ```
 
-Typical metadata includes:
+Typical metadata:
 
 ```text
 event_index
 original_event_id
 shell_index
 source_file
-source_fidelity
+fidelity
 split_name
-output_fidelity
 detector_R
 detector_Z
 detector_z_center
 ```
 
-The HDF5 label arrays must match the CNP YAML settings exactly.
+There should be no alternate fidelity fields such as `source_fidelity` or `output_fidelity`.
 
 ---
 
@@ -423,7 +370,6 @@ Example `config/settings_shell_minibatch.yaml`:
 ```yaml
 simulation_settings:
   simulation_type: shell
-
   n_shells: 100
 
   theta_headers:
@@ -437,6 +383,7 @@ simulation_settings:
   target_headers:
     - target_shell
 
+  # Geometry range used for an optional MF-GP prediction grid.
   theta_min:
     - 1000.0
     - 1400.0
@@ -448,15 +395,12 @@ simulation_settings:
 cnp_settings:
   training_mode: minibatch
   context_mode: random
-
   training_epochs: 15
   steps_per_epoch: 5000
-
   context_ratio: 0.3333333333333333
   batch_size_train: 12000
   files_per_batch_train: 32
   ratio_testing_vs_training: 0.1
-
   plot_after: 1000
 
 path_settings:
@@ -472,38 +416,17 @@ path_settings:
     - 0
     - 0
 
-  fidelity:
-    - 0
-    - 1
-
   path_out_cnp: ../outputs/cnp
   path_out_mfgp: ../outputs/mfgp
 ```
 
-Relative paths in the YAML are resolved relative to the YAML file.
+There is no fidelity list in the YAML. CNP prediction reads the per-event `fidelity` dataset from HDF5 metadata.
 
-The entries in these three lists refer to the same prediction datasets:
-
-```yaml
-path_to_files_predict:
-iteration:
-fidelity:
-```
-
-Keep their ordering aligned.
-
-Typical MF-GP fidelity IDs are:
-
-```text
-0 = LF
-1 = HF
-```
+The `iteration` list remains aligned with `path_to_files_predict` when multiple experiment iterations are exported.
 
 ---
 
 # 3. Train the CNP
-
-## CNP input and output
 
 For each event:
 
@@ -512,53 +435,20 @@ x = concatenate(theta, phi)
 y = target_shell
 ```
 
-The model returns a vector of shell logits, which becomes a shell-probability distribution after softmax.
+The model returns 100 shell logits, which become a probability distribution after softmax.
 
-The current implementation uses:
+The implementation includes:
 
 - a deterministic CNP encoder and decoder;
-- context labels represented as one-hot shell vectors;
+- one-hot context shell labels;
 - weighted categorical cross entropy;
-- class weights derived from observed shell counts;
+- class weights based on training shell counts;
 - gradient clipping;
 - random or fixed context size;
 - minibatch or full-pass training;
 - MC dropout during prediction.
 
-## Training modes
-
-### `minibatch`
-
-Each epoch performs a configured number of random sampled steps:
-
-```yaml
-training_mode: minibatch
-steps_per_epoch: 5000
-```
-
-An epoch does not necessarily visit every event.
-
-### `full_pass`
-
-Each epoch iterates over all events in the configured training directory:
-
-```yaml
-training_mode: full_pass
-```
-
-This is more directly comparable to a conventional epoch, but it can take substantially longer.
-
-## Context modes
-
-### `random`
-
-The number of context events varies between the minimum allowed value and the configured maximum.
-
-### `fixed`
-
-Every batch uses the configured context count.
-
-## Train from the command line
+## Train
 
 ```bash
 python cnp_mfgp/cnp_clean_pipeline.py \
@@ -567,7 +457,7 @@ python cnp_mfgp/cnp_clean_pipeline.py \
   train
 ```
 
-CPU example:
+CPU:
 
 ```bash
 python cnp_mfgp/cnp_clean_pipeline.py \
@@ -592,45 +482,13 @@ python cnp_mfgp/cnp_clean_pipeline.py \
   --monitor-every 1000
 ```
 
-## Training outputs
-
-The configured CNP output directory receives files such as:
-
-```text
-cnp_<version>_model_<epochs>epochs.pth
-cnp_<version>_history_<epochs>epochs.csv
-cnp_<version>_training_curve_<epochs>epochs.png
-cnp_<version>_sample_predictions_<epochs>epochs.png
-cnp_<version>_class_monitor_latest.png
-```
-
-The history CSV records:
-
-```text
-train_loss
-val_loss
-train_acc
-val_acc
-train_mae_shell
-val_mae_shell
-```
-
-The validation values generated during CNP training come from independently sampled batches from the configured training pool. Held-out HF validation prediction is a separate workflow.
-
 ---
 
 # 4. Run CNP prediction
 
-Prediction loads a checkpoint and evaluates every configured prediction directory.
+CNP prediction evaluates every configured HDF5 directory and preserves each event's manifest-defined fidelity.
 
-MC dropout repeats each forward pass and estimates:
-
-```text
-mean shell probability
-standard deviation of shell probability
-```
-
-## Predict from an existing checkpoint
+## Training LF/HF prediction
 
 ```bash
 python cnp_mfgp/cnp_clean_pipeline.py \
@@ -643,21 +501,9 @@ python cnp_mfgp/cnp_clean_pipeline.py \
   --output-suffix output
 ```
 
-## Train and predict in one run
+## Held-out HF validation prediction
 
-```bash
-python cnp_mfgp/cnp_clean_pipeline.py \
-  --config cnp_mfgp/config/settings_shell_minibatch.yaml \
-  --device cuda \
-  full \
-  --mc-samples 30 \
-  --chunk-size 20000 \
-  --output-suffix output
-```
-
-## Predict on held-out validation data
-
-Use a validation YAML whose `path_to_files_predict` points to:
+Use a validation YAML whose prediction path is:
 
 ```text
 <prepared data>/validation/hf
@@ -674,148 +520,164 @@ python cnp_mfgp/cnp_clean_pipeline.py \
   --output-suffix output_validation
 ```
 
-Use a distinct suffix or version so the validation files do not overwrite the training prediction files.
+Use a separate suffix so validation output does not overwrite training output.
 
-## Prediction outputs
+## Aggregated MF-GP input
 
-### Aggregated MF-GP input
+The principal CNP output is:
 
 ```text
 cnp_<version>_<suffix>_<epochs>epochs.csv
 ```
 
-This table is grouped by:
+The table is long-form and grouped by:
 
 ```text
 iteration
 fidelity
-theta columns
+detector_R
+detector_Z
 shell_index
 ```
 
-and contains:
+Important columns:
 
-```text
-n_samples
-y_cnp
-y_cnp_err
-y_raw
-log_prop
-bce
-source_file
-```
+| Column | Meaning |
+|---|---|
+| `fidelity` | Manifest-defined `0` or `1` |
+| `shell_index` | One-based shell number |
+| `n_samples` | Events contributing to the aggregate |
+| `y_cnp` | Mean CNP probability assigned to the shell |
+| `y_cnp_err` | MC-dropout probability uncertainty |
+| `y_raw` | Observed fraction of events in the shell |
 
-Definitions:
+For each geometry/fidelity combination, the CSV must contain exactly one aggregate row for every shell from `1` through `n_shells`.
 
-- `y_cnp`: mean predicted probability for that shell;
-- `y_cnp_err`: root-mean-square MC-dropout standard deviation;
-- `y_raw`: observed fraction of events in that shell;
-- `shell_index`: one-based shell index.
+## Large diagnostic output
 
-### Best shell per event
-
-```text
-cnp_<version>_<suffix>_<epochs>epochs_best_shell.csv
-```
-
-This contains the most probable shell for each event, the corresponding probability and uncertainty, and available event metadata.
-
-### Optional full event-shell table
-
-```text
-cnp_<version>_<suffix>_<epochs>epochs_all_shells.csv
-```
-
-This contains one row per:
-
-```text
-event × shell
-```
-
-The default is:
+The optional all-shell CSV contains one row per event × shell and can become extremely large. Keep:
 
 ```python
 all_shells=False
 ```
 
-This should remain disabled for routine prediction. With millions of events and 100 shells, the full table can require tens of gigabytes and greatly increase runtime.
-
-The command-line parser does not expose an `--all-shells` flag. Enable it through Python only when the full diagnostic table is needed:
-
-```python
-from cnp_mfgp.cnp_clean_pipeline import (
-    load_runtime_config,
-    predict_cnp,
-)
-
-runtime = load_runtime_config(
-    "cnp_mfgp/config/settings_shell_minibatch.yaml"
-)
-
-result = predict_cnp(
-    runtime=runtime,
-    model_path="cnp_mfgp/outputs/cnp/cnp_shell_v1_model_15epochs.pth",
-    mc_samples=30,
-    chunk_size=20000,
-    all_shells=True,
-)
-```
+for routine runs. The aggregated MF-GP input already contains the complete shell distribution and does not require the event × shell table.
 
 ---
 
-# 5. Fit the MF-GP
+# 5. Fit the distribution-aware MF-GP
 
-The MF-GP uses a two-level autoregressive model:
+## Why the structure changed
 
-```text
-y_HF(theta) = rho * y_LF(theta) + delta(theta)
-```
-
-The stages are:
-
-1. Fit an LF Gaussian process.
-2. Evaluate the LF model at HF geometries.
-3. Estimate `rho`.
-4. Fit a discrepancy GP to:
+A 100-bin shell output is one correlated probability distribution:
 
 ```text
-y_HF - rho * y_LF
+[p_1, p_2, ..., p_100]
 ```
 
-5. Combine LF and discrepancy predictions and uncertainties.
-
-The implementation uses scikit-learn with:
-
-- standardized inputs;
-- standardized targets;
-- constant × Matérn-3/2 kernels;
-- white-noise kernels;
-- separate LF and discrepancy GPs.
-
-## MF-GP input columns
-
-The input CSV must contain:
+The bins are not 100 independent detector observations. They are constrained by:
 
 ```text
-theta headers
-iteration
-fidelity
-y_cnp
-y_cnp_err
-y_raw
+p_i >= 0
+sum_i p_i = 1
 ```
 
-The LF model is trained on:
+The recommended pipeline therefore uses one geometry as one statistical sample with a 100-dimensional output.
+
+## Long-form to geometry-level matrix
+
+The CNP CSV is converted from:
 
 ```text
-theta -> y_cnp
+detector_R | detector_Z | fidelity | shell_index | probability
 ```
 
-The HF discrepancy model is trained using:
+into one vector per geometry and fidelity:
 
 ```text
-theta -> y_raw
+detector_R | detector_Z | fidelity | p_1 | p_2 | ... | p_100
 ```
+
+The model uses:
+
+```text
+LF distribution = y_cnp for fidelity 0
+HF distribution = y_raw for fidelity 1
+```
+
+## Centered-log-ratio transformation
+
+Raw probability vectors live on a simplex rather than ordinary Euclidean space. Before PCA, the pipeline:
+
+1. clips each probability with a small epsilon;
+2. renormalizes the vector;
+3. applies the centered-log-ratio transform.
+
+For a distribution `p`:
+
+```text
+clr(p_i) = log(p_i) - mean_j(log(p_j))
+```
+
+This makes relative changes among shell probabilities suitable for PCA and GP modeling.
+
+## PCA compression
+
+PCA is fitted on the combined LF and HF training distributions in CLR space.
+
+The 100-shell distribution becomes a smaller coefficient vector:
+
+```text
+[p_1, ..., p_100]
+        ↓ CLR + PCA
+[z_1, z_2, ..., z_k]
+```
+
+By default, enough components are retained to explain 99.5% of the training variance. These optional settings can be added to the existing YAML without changing any paths or file layout:
+
+```yaml
+mfgp_settings:
+  pca_components: 0.995
+  pca_epsilon: 1.0e-8
+  distribution_mc_samples: 500
+```
+
+`pca_components` may also be an integer such as `5`. If the section is omitted, the defaults above are used.
+
+## Autoregressive MF-GP per coefficient
+
+For every retained PCA coefficient `z_k`, the pipeline fits:
+
+```text
+z_HF,k(theta) = rho_k * z_LF,k(theta) + delta_k(theta)
+```
+
+where:
+
+- the LF GP learns the low-fidelity coefficient over geometry;
+- `rho_k` scales the LF prediction at HF geometries;
+- the discrepancy GP learns the remaining HF correction.
+
+The coefficients are then reconstructed through inverse PCA and inverse CLR.
+
+The final shell predictions are automatically:
+
+- nonnegative;
+- normalized to sum to one;
+- represented as complete correlated distributions.
+
+## Uncertainty reconstruction
+
+The pipeline draws Monte Carlo samples from the independent latent coefficient predictions, reconstructs each shell distribution, and reports:
+
+```text
+predicted_shell_probabilities
+predicted_shell_std
+predicted_shell_q025
+predicted_shell_q975
+```
+
+Each reconstructed draw sums to one. The current implementation fits the latent coefficient GPs independently and samples their predictive uncertainties independently. PCA makes the training coefficients orthogonal, but this approximation does not represent every possible cross-component posterior correlation.
 
 ## Run the MF-GP
 
@@ -825,296 +687,190 @@ python cnp_mfgp/mfgp_clean_pipeline.py \
   --cnp-csv cnp_mfgp/outputs/cnp/cnp_shell_v1_output_15epochs.csv \
   --validation-csv cnp_mfgp/outputs/cnp/cnp_shell_v1_output_validation_15epochs.csv \
   --iteration 0 \
-  --lf-fidelity 0 \
-  --hf-fidelity 1 \
-  --target-transform linear
+  --target-transform linear \
+  --grid-points 30
 ```
 
-Available target transforms:
+Optional command-line arguments remain compatible with the existing pipeline:
 
-```text
-linear
-log_hf
-log_lf
-log_both
-```
+| Option | Meaning |
+|---|---|
+| `--cnp-csv` | Explicit aggregated CNP training CSV |
+| `--validation-csv` | Explicit aggregated HF validation CSV |
+| `--iteration` | Iteration value to select |
+| `--target-transform linear` | Compatibility option; CLR+PCA is used internally |
+| `--grid-points` | Geometry grid points per theta axis |
+| `--random-state` | Random seed |
+| `--quiet` | Reduce console output |
 
-Run all four:
+## Single-geometry smoke test
 
-```bash
-python cnp_mfgp/mfgp_clean_pipeline.py \
-  --config cnp_mfgp/config/settings_shell_minibatch.yaml \
-  --cnp-csv cnp_mfgp/outputs/cnp/cnp_shell_v1_output_15epochs.csv \
-  --validation-csv cnp_mfgp/outputs/cnp/cnp_shell_v1_output_validation_15epochs.csv \
-  --all-transforms
-```
+A single geometry with LF and HF data is accepted automatically.
 
-Other useful options:
+This verifies:
 
-```text
---grid-points 120
---predict-chunk-size 20000
---random-state 42
---log-epsilon <value>
---prefer-validation-csv
---quiet
-```
+- long-form shell loading;
+- fidelity separation;
+- shell-vector pivoting;
+- CLR/PCA compression;
+- latent MF-GP fitting;
+- distribution reconstruction;
+- output and plotting code.
+
+It does **not** validate geometry interpolation. With one geometry, detector-length scales and geometry dependence are not statistically identifiable. The script prints a warning when fewer than three geometries exist in either fidelity.
+
+For a scientific geometry-learning run, use several distinct LF and HF geometries. Three is still only a minimal practical threshold; more geometries are preferable.
 
 ## MF-GP outputs
 
-The configured MF-GP directory receives:
+The MF-GP output directory receives files such as:
 
 ```text
-mfgp_<version-and-transform>_model_iter<iteration>.json
-mfgp_<version-and-transform>_metrics_iter<iteration>.json
-mfgp_<version-and-transform>_predictions_iter<iteration>.csv
-mfgp_<version-and-transform>_grid_iter<iteration>.csv
+mfgp_<version>_linear_model_iter0.json
+mfgp_<version>_linear_metrics_iter0.json
+mfgp_<version>_linear_predictions_iter0.csv
+mfgp_<version>_linear_grid_iter0.csv
+mfgp_<version>_linear_hf_observations_iter0.png
+mfgp_<version>_linear_mean_std_iter0.png
+mfgp_<version>_linear_validation_shell_distributions_iter0.png
 ```
 
-It also creates available diagnostics such as:
+The prediction and grid CSVs contain one row per detector geometry. Their list-valued columns store the complete reconstructed shell distribution and uncertainty interval:
 
 ```text
-HF observation maps
-mean and standard-deviation surfaces
-interactive 3D HTML surfaces
-parity plots
-residual plots
-across-theta comparisons
-coverage plots
-validation uncertainty bands
+predicted_shell_probabilities
+predicted_shell_std
+predicted_shell_q025
+predicted_shell_q975
 ```
 
-The metrics JSON includes:
+## Model artifacts
+
+The pipeline keeps the existing artifact structure. It writes:
 
 ```text
-RMSE
-MAE
-R²
-rho
-sample counts
-target-transform metadata
+mfgp_<version>_linear_model_iter<iteration>.json
+mfgp_<version>_linear_metrics_iter<iteration>.json
+mfgp_<version>_linear_predictions_iter<iteration>.csv
+mfgp_<version>_linear_grid_iter<iteration>.csv
 ```
 
-## Current shell aggregation behavior
+The model JSON records the PCA representation, component-level `rho` values, input geometry headers, fidelity definition, and sample counts. The fitted Python object is not serialized, so there is no `cloudpickle` dependency. The model is fitted and used in memory during the normal pipeline run, matching the previous `mfgp_clean_pipeline.py` workflow.
 
-The CNP aggregate CSV preserves `shell_index`.
+## Metrics
 
-The current MF-GP loader then groups rows by:
+The metrics JSON includes distribution-level measures:
 
 ```text
-theta headers + fidelity + iteration
+mean_shell_rmse
+mean_shell_mae
+mean_total_variation
+mean_jensen_shannon
+max_sum_error
 ```
 
-and does not include `shell_index` in its model input.
+Total variation and Jensen–Shannon divergence compare the complete predicted and true shell distributions rather than evaluating each shell in isolation.
 
-Therefore, the current MF-GP fits a geometry-level average over the shell rows rather than a separate response for every shell.
+---
 
-A shell-specific MF-GP would require one of these changes:
+# Internal MF-GP data structure
 
-- fit one MF-GP per shell;
-- include `shell_index` as a model feature;
-- preserve `shell_index` in the grouping keys and use a multi-output model.
+The CNP aggregate CSV remains unchanged and long-form, with one row per geometry, fidelity, and shell. `mfgp_clean_pipeline.py` pivots it internally into one row per detector geometry and fidelity:
 
-This behavior should be considered when interpreting the MF-GP output.
+```text
+detector_R | detector_Z | fidelity | cnp_shell_probabilities
+```
+
+`cnp_shell_probabilities` is an ordered list of length `n_shells`. The same internal row also retains the observed `y_raw` shell distribution and CNP uncertainty list. The LF latent model uses fidelity-0 CNP probabilities, while the HF discrepancy uses fidelity-1 observed shell fractions.
+
+This conversion happens only inside the MF-GP loader. It does not change the CNP CSV, prepared-data directories, or repository file layout.
+
+---
+
+# Validation design
+
+Validation is high-fidelity only.
+
+Preprocessing randomly holds out the configured fraction of fidelity-1 events. CNP prediction aggregates those held-out events into one observed HF shell distribution per geometry.
+
+The MF-GP uses:
+
+- training CSV: LF and HF rows;
+- validation CSV: HF-only rows.
+
+The validation CSV must contain only:
+
+```text
+fidelity = 1
+```
+
+It is never used to fit PCA or the latent GPs.
+
+Because preprocessing splits HF **events**, training and validation may describe the same detector geometry using independent event samples. This evaluates reconstruction stability and finite-sample distribution agreement at known geometries. It does not by itself test interpolation to an unseen detector geometry. Geometry-generalization testing requires holding out one or more complete geometry values separately.
 
 ---
 
 # Emulation
 
-`emulation.py` generates synthetic source positions and runs them through a trained CNP.
+`emulation.py` generates synthetic source positions and passes them through a trained CNP.
 
-The default generator samples a cylindrical skin outside the detector side wall:
+The default source generator samples a cylindrical skin outside the detector side wall:
 
 ```text
 R_max <= s_r <= R_max + width
 ```
 
-with source z distributed over the detector height.
-
-Top and bottom cap skins can optionally be included.
-
-## Generate emulated source points
-
-```python
-from cnp_mfgp.emulation import emulate_detector_points
-
-emulated = emulate_detector_points(
-    n_points=100000,
-    radius=1490.0,
-    height=3966.0,
-    width=100.0,
-    z_min=0.0,
-    include_caps=False,
-    seed=42,
-)
-
-emulated.to_csv(
-    "data/emulation/outside_sidewall.csv",
-    index=False,
-)
-```
-
-The generated table includes:
-
-```text
-sx, sy, sz
-E0, ETPC
-x, y, z
-```
-
-The endpoint columns are placeholders used to match the event-file schema.
-
-## Predict on emulated points
-
-```python
-from common.config import ShellConfig
-from cnp_mfgp.cnp_clean_pipeline import load_runtime_config
-from cnp_mfgp.emulation import predict_cnp_from_emulated_csv
-
-runtime = load_runtime_config(
-    "cnp_mfgp/config/settings_shell_minibatch.yaml"
-)
-
-shell_cfg = ShellConfig(
-    R_max=1490.0,
-    Z_max=1983.0,
-    z_center=1983.0,
-    n_shells=100,
-    min_candidate_events=1,
-    scale_power=1.0 / 3.0,
-)
-
-result = predict_cnp_from_emulated_csv(
-    emulated_csv="data/emulation/outside_sidewall.csv",
-    runtime=runtime,
-    model_path="cnp_mfgp/outputs/cnp/cnp_shell_v1_model_15epochs.pth",
-    output_dir="cnp_mfgp/outputs/emulation",
-    shell_cfg=shell_cfg,
-    h5_block_size=100000,
-    mc_samples=30,
-    chunk_size=20000,
-    all_shells=False,
-)
-```
-
-The helper:
-
-1. derives CNP phi features;
-2. creates temporary HDF5 prediction blocks;
-3. runs `predict_cnp`;
-4. changes truth shell values to `-1`;
-5. removes dummy `y_raw` values;
-6. empties the aggregate MF-GP CSV by default.
-
-The MF-GP CSV is emptied because dummy shell labels used to satisfy the CNP HDF5 interface are not physical emulation truth.
-
----
-
-# Visualization
-
-`visualize.py` provides reusable plotting helpers.
-
-Available public functions include:
-
-```text
-resolve_input_paths
-load_df_with_rt
-find_shells
-find_shell_occupations
-exponential_regression
-cylinder
-plot_shell_histogram
-plot_cnp_pred_shell_occupancy
-plot_input_shell_occupancy
-plot_input_points_3d
-```
-
-## Plot predicted and true shell distributions
-
-```python
-from cnp_mfgp.visualize import plot_cnp_pred_shell_occupancy
-
-fig, axes = plot_cnp_pred_shell_occupancy(
-    result,
-    outpath="cnp_mfgp/outputs/figures/predicted_vs_true_shells.png",
-)
-```
-
-For emulated data, truth shell indices are `-1`, so only the predicted distribution is meaningful.
-
-## Plot raw input points interactively
-
-```python
-from cnp_mfgp.visualize import plot_input_points_3d
-
-plot_input_points_3d(
-    inpath="data/raw/*.csv",
-    outpath="cnp_mfgp/outputs/figures/input_points.html",
-    max_points=50000,
-    r_max=1490.0,
-    z_min=0.0,
-    z_max=3966.0,
-    seed=42,
-)
-```
+Emulated endpoint labels are placeholders, so emulation output should not be used as HF truth for MF-GP fitting unless physical truth is available independently.
 
 ---
 
 # Recommended notebook workflow
 
-The scripts are the source of truth. Notebooks should orchestrate them.
+1. Locate the repository root.
+2. Define raw, prepared, and output paths.
+3. Prepare HDF5 blocks from `file_manifest.csv`.
+4. Train or load the CNP.
+5. Predict on LF training, HF training, and held-out HF validation data.
+6. Confirm that every geometry/fidelity contains all shell indices.
+7. Inspect CNP shell distributions.
+8. Fit `mfgp_clean_pipeline.py`.
+9. Inspect PCA explained variance.
+10. Compare reconstructed HF training and validation distributions.
+11. Evaluate total variation and Jensen–Shannon divergence.
+12. Save all artifacts under `outputs/`.
 
-A notebook run should generally:
-
-1. locate the repository root;
-2. define paths and experiment settings;
-3. call the preprocessing functions or run the preprocessing script;
-4. load the YAML runtime;
-5. train or load a CNP checkpoint;
-6. predict on LF, HF, and validation datasets;
-7. inspect shell-level metrics and plots;
-8. fit the MF-GP;
-9. compare training and validation geometry trends;
-10. save all generated artifacts under `outputs/`.
-
-Avoid copying model, geometry, or HDF5 implementations directly into notebooks.
+Notebooks should call pipeline functions rather than copying their implementations.
 
 ---
 
-# Output and storage guidance
+# Storage guidance
 
-## Do not save all shells unless required
+## Do not save event × shell output routinely
 
-The all-shell table scales as:
+The optional all-shell table scales as:
 
 ```text
 number of events × number of shells
 ```
 
-For 15 million events and 100 shells, this represents 1.5 billion rows before considering CSV overhead.
+For 15 million events and 100 shells, this is 1.5 billion rows before CSV overhead.
 
-Use:
+The MF-GP only needs the aggregated shell CSV, so keep:
 
 ```python
 all_shells=False
 ```
 
-for standard training, validation, and emulation runs.
+## Version prepared datasets
 
-## Keep dataset builds versioned
-
-Preprocessing deletes its configured output directory. Use distinct directories such as:
+Preprocessing deletes its output directory before rebuilding it. Use paths such as:
 
 ```text
 data/processed/cnp_mfgp_v1/
 data/processed/cnp_mfgp_v2/
 ```
 
-when previous builds must be retained.
-
 ## Separate datasets from model outputs
-
-Recommended locations:
 
 ```text
 data/                         raw and prepared event data
@@ -1128,129 +884,94 @@ cnp_mfgp/outputs/figures/     plots and HTML views
 
 # Troubleshooting
 
-## Repository root cannot be found
+## Manifest fidelity error
 
-Confirm that the repository root contains:
-
-```text
-README.md
-PROJECT_EXPERIMENT_GUIDE.md
-```
-
-Run commands from that directory.
-
-## `common` cannot be imported
-
-Run from the repository root rather than from inside `cnp_mfgp/`.
-
-Alternatively, install the repository as an editable package once packaging metadata is added.
-
-## Default configuration path does not exist
-
-Pass `--config` explicitly:
-
-```bash
---config cnp_mfgp/config/<settings-file>
-```
-
-This is recommended for every script.
-
-## Manifest geometry fails to load
-
-Confirm that every row has numeric values for:
+Every manifest row must have exactly:
 
 ```text
-R
-Z
-z_center
-fidelity
+fidelity = 0
 ```
 
-and that every `filename` exists inside the configured input directory.
+or:
 
-## HDF5 label mismatch
-
-The YAML must match the labels stored during preprocessing:
-
-```yaml
-theta_headers:
-  - detector_R
-  - detector_Z
-
-phi_labels:
-  - s_r
-  - s_z_from_center
-
-target_headers:
-  - target_shell
+```text
+fidelity = 1
 ```
 
-Rebuild the HDF5 blocks after changing these definitions.
+Values such as `LF`, `HF`, `2`, `0.5`, blanks, or inferred directory labels are invalid.
+
+## MF-GP cannot find both fidelities
+
+The training CNP aggregate CSV must contain both:
+
+```text
+fidelity = 0
+fidelity = 1
+```
+
+The validation aggregate CSV should contain only:
+
+```text
+fidelity = 1
+```
+
+## Incomplete shell grid
+
+For every geometry and fidelity, confirm that the aggregate CSV contains exactly:
+
+```text
+shell_index = 1, 2, ..., n_shells
+```
+
+Missing or duplicate shells cause the distribution pipeline to stop rather than silently constructing an invalid vector.
+
+## Only one LF/HF point is reported
+
+The distribution pipeline counts detector geometries, not shell rows. One detector geometry is intentionally one statistical sample with a 100-dimensional output.
+
+A message reporting:
+
+```text
+LF geometries: 1
+HF geometries: 1
+```
+
+is therefore correct for a one-geometry smoke test.
+
+## Fewer than three geometries warning
+
+This warning means the pipeline can run but cannot reliably learn geometry-dependent length scales or interpolation. Add additional detector geometries for scientific use.
+
+## PCA keeps only one component
+
+With one LF and one HF geometry, only two distribution samples are available to fit PCA, so the rank is at most one after centering. This is expected for a smoke test.
+
+More geometries permit additional distribution-shape modes to be learned.
+
+## Predicted probabilities do not sum to one
+
+The MF-GP normalizes every inverse CLR reconstruction. Sum errors should be near floating-point precision. Check that you are using `mfgp_clean_pipeline.py`, not a custom scalar reconstruction.
 
 ## CUDA or system memory is exhausted
 
-Reduce:
+Reduce CNP:
 
 ```yaml
 batch_size_train
 files_per_batch_train
 ```
 
-or lower prediction:
+or reduce prediction:
 
 ```text
 --chunk-size
 ```
 
-## Disk fills during prediction
+The MF-GP itself operates on geometry-level aggregate vectors and is normally much smaller than event-level CNP prediction.
 
-Confirm that all-shell prediction is disabled.
+## Disk fills during CNP prediction
 
-Also check old dataset builds, output versions, temporary HDF5 files, and the operating-system trash directory.
-
-## MF-GP cannot find both fidelities
-
-Inspect the CNP CSV and verify that it contains rows with the IDs passed as:
-
-```text
---lf-fidelity
---hf-fidelity
-```
-
-Also verify the aligned YAML lists:
-
-```yaml
-path_to_files_predict
-iteration
-fidelity
-```
-
-## MF-GP auto-discovery finds no CSV
-
-Auto-discovery expects a name matching approximately:
-
-```text
-cnp_<version>_output_<epochs>epochs.csv
-```
-
-Use:
-
-```text
---output-suffix output
-```
-
-during CNP prediction, or pass `--cnp-csv` explicitly.
-
-## Validation output overwrites training output
-
-Use different suffixes:
-
-```text
-output
-output_validation
-```
-
-or different version names.
+Confirm that event × shell output is disabled and remove obsolete datasets, prediction versions, temporary HDF5 files, or operating-system trash.
 
 ---
 
@@ -1268,7 +989,7 @@ python cnp_mfgp/cnp_clean_pipeline.py \
   --device cuda \
   train
 
-# Predict LF/HF
+# Predict LF and HF training data
 python cnp_mfgp/cnp_clean_pipeline.py \
   --config cnp_mfgp/config/settings_shell_minibatch.yaml \
   --device cuda \
@@ -1276,7 +997,7 @@ python cnp_mfgp/cnp_clean_pipeline.py \
   --model-path cnp_mfgp/outputs/cnp/<checkpoint>.pth \
   --output-suffix output
 
-# Predict held-out validation
+# Predict held-out HF validation data
 python cnp_mfgp/cnp_clean_pipeline.py \
   --config cnp_mfgp/config/settings_shell_validation.yaml \
   --device cuda \
@@ -1284,17 +1005,15 @@ python cnp_mfgp/cnp_clean_pipeline.py \
   --model-path cnp_mfgp/outputs/cnp/<checkpoint>.pth \
   --output-suffix output_validation
 
-# Fit MF-GP
+# Fit the recommended distribution-aware MF-GP
 python cnp_mfgp/mfgp_clean_pipeline.py \
   --config cnp_mfgp/config/settings_shell_minibatch.yaml \
   --cnp-csv cnp_mfgp/outputs/cnp/<training-prediction>.csv \
   --validation-csv cnp_mfgp/outputs/cnp/<validation-prediction>.csv \
   --iteration 0 \
-  --lf-fidelity 0 \
-  --hf-fidelity 1 \
   --target-transform linear
 ```
 
-For broader repository organization, see [`../README.md`](../README.md).
+For broader repository organization, see `../README.md`.
 
-For development history and experiment rationale, see [`../PROJECT_EXPERIMENT_GUIDE.md`](../PROJECT_EXPERIMENT_GUIDE.md).
+For development history and experiment rationale, see `../PROJECT_EXPERIMENT_GUIDE.md`.

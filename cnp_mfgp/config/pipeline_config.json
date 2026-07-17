@@ -4,8 +4,7 @@
     "max_rows_per_file": null
   },
   "split": {
-    "lf_pool_fraction": 0.2,
-    "hf_pool_fraction": 0.4,
+    "validation_fraction": 0.4,
     "random_seed": 42,
     "stratify_by_component": false
   },

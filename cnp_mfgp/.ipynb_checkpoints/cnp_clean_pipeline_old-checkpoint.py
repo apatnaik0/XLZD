@@ -32,45 +32,6 @@ from tqdm.auto import tqdm
 # Configuration and utilities
 # -----------------------------
 
-LOW_FIDELITY = 0
-HIGH_FIDELITY = 1
-VALID_FIDELITIES = {LOW_FIDELITY, HIGH_FIDELITY}
-
-
-def _validate_binary_fidelity_array(
-    values: object,
-    *,
-    n_events: int,
-    context: str,
-) -> np.ndarray:
-    """Validate per-event fidelity metadata as exactly 0 (LF) or 1 (HF)."""
-    arr = np.asarray(values).reshape(-1)
-    if arr.size == 1:
-        arr = np.full(n_events, arr.item())
-    elif len(arr) != n_events:
-        raise ValueError(
-            f"{context}: fidelity has {len(arr)} values for {n_events} events. "
-            "Expected one value per event, or one scalar for a homogeneous block."
-        )
-
-    numeric = pd.to_numeric(pd.Series(arr), errors="coerce")
-    numeric_values = numeric.to_numpy(dtype=float)
-    invalid = (
-        numeric.isna().to_numpy()
-        | ~np.isfinite(numeric_values)
-        | ~np.isclose(numeric_values, np.rint(numeric_values))
-        | ~numeric.isin(VALID_FIDELITIES).to_numpy()
-    )
-    if invalid.any():
-        bad_values = arr[invalid].tolist()
-        raise ValueError(
-            f"{context}: invalid fidelity values {bad_values}. "
-            "Fidelity must be exactly 0 (low fidelity) or 1 (high fidelity), "
-            "as defined in file_manifest.csv."
-        )
-
-    return numeric_values.astype(np.int32)
-
 
 @dataclass
 class CNPRuntimeConfig:
@@ -79,6 +40,7 @@ class CNPRuntimeConfig:
     train_dir: Path
     predict_dirs: List[Path]
     predict_iterations: List[int]
+    predict_fidelities: List[int]
     out_dir: Path
     n_shells: int
     theta_headers: List[str]
@@ -128,9 +90,12 @@ def load_runtime_config(
 
     predict_dirs = [_resolve_path(p, base) for p in paths.get("path_to_files_predict", [])]
     predict_iterations = [int(x) for x in paths.get("iteration", [0] * len(predict_dirs))]
+    predict_fidelities = [int(x) for x in paths.get("fidelity", [0] * len(predict_dirs))]
 
     if len(predict_iterations) < len(predict_dirs):
         predict_iterations.extend([0] * (len(predict_dirs) - len(predict_iterations)))
+    if len(predict_fidelities) < len(predict_dirs):
+        predict_fidelities.extend([0] * (len(predict_dirs) - len(predict_fidelities)))
     
     return CNPRuntimeConfig(
         config_path=config_path,
@@ -138,6 +103,7 @@ def load_runtime_config(
         train_dir=_resolve_path(paths["path_to_files_train"], base),
         predict_dirs=predict_dirs,
         predict_iterations=predict_iterations,
+        predict_fidelities=predict_fidelities,
         out_dir=_resolve_path(paths.get("path_out_cnp", "../../data/out/cnp"), base),
         n_shells=int(sim.get("n_shells", 100)),
         theta_headers=list(sim.get("theta_headers", ["detector_R", "detector_Z"])),
@@ -212,7 +178,7 @@ class H5EventPool:
         if not self.directory.exists():
             raise FileNotFoundError(f"H5 directory does not exist: {self.directory}")
 
-        self.files = sorted([p for p in self.directory.rglob("*.h5") if p.is_file()])
+        self.files = sorted([p for p in self.directory.glob("*.h5") if p.is_file()])
         if not self.files:
             raise FileNotFoundError(f"No .h5 files found in {self.directory}")
 
@@ -250,17 +216,6 @@ class H5EventPool:
             phi = np.asarray(f["phi"], dtype=np.float32)
             target_shell = np.asarray(f["target_shell"], dtype=np.int64).reshape(-1)
             meta = self._read_meta(f)
-
-            if "fidelity" not in meta:
-                raise ValueError(
-                    f"{file_path.name}: missing required meta/fidelity. "
-                    "Fidelity must originate from file_manifest.csv during data preparation."
-                )
-            meta["fidelity"] = _validate_binary_fidelity_array(
-                meta["fidelity"],
-                n_events=len(target_shell),
-                context=f"{file_path.name} meta/fidelity",
-            )
 
             if theta.ndim != 2:
                 raise ValueError(f"{file_path.name}: expected theta shape (N, theta_dim), got {theta.shape}")
@@ -1287,24 +1242,6 @@ def predict_cnp(
 
         return arr.astype(dtype)
 
-    def required_fidelity(
-        meta: dict[str, np.ndarray],
-        n: int,
-        *,
-        file_path: Path,
-    ) -> np.ndarray:
-        """Read binary fidelity metadata without inventing or coercing a fallback."""
-        if "fidelity" not in meta:
-            raise ValueError(
-                f"{file_path.name}: missing required meta/fidelity. "
-                "The value must originate from file_manifest.csv during data preparation."
-            )
-        return _validate_binary_fidelity_array(
-            meta["fidelity"],
-            n_events=n,
-            context=f"{file_path.name} meta/fidelity",
-        )
-
     def meta_strings(
         meta: dict[str, np.ndarray],
         key: str,
@@ -1333,16 +1270,24 @@ def predict_cnp(
     print("=" * 80)
 
     for i, pred_dir in enumerate(runtime.predict_dirs):
-        # Folder names identify only the data split. Fidelity is read from
-        # each event's H5 metadata and ultimately originates in file_manifest.csv.
+        # Log datatype being run
         pred_dir_str = str(pred_dir).lower()
-        if "validation" in pred_dir_str:
-            dataset_type = "VALIDATION"
-        elif "training" in pred_dir_str or "train" in pred_dir_str:
-            dataset_type = "TRAINING"
-        else:
-            dataset_type = pred_dir.name or "PREDICTION"
 
+        if "validation" in pred_dir_str:
+            if "hf" in pred_dir_str:
+                dataset_type = "VAL-HF"
+            elif "lf" in pred_dir_str:
+                dataset_type = "VAL-LF"
+            else:
+                dataset_type = "VAL"
+        elif "hf" in pred_dir_str:
+            dataset_type = "TRAIN-HF"
+        elif "lf" in pred_dir_str:
+            dataset_type = "TRAIN-LF"
+        else:
+            dataset_type = "UNKNOWN"
+
+        fidelity = runtime.predict_fidelities[i]
         iteration = runtime.predict_iterations[i]
 
         pool = H5EventPool(
@@ -1356,7 +1301,7 @@ def predict_cnp(
         )
 
         # Setup tqdm progress bar
-        files = list(Path(pred_dir).rglob("*.h5"))
+        files = list(Path(pred_dir).glob("*.h5"))
 
         with tqdm(total=len(files), desc=f"{dataset_type}", unit="block") as pbar:
             for file_path, x_np, target_shell_np, meta in pool.iter_file_data():
@@ -1401,10 +1346,12 @@ def predict_cnp(
                     default=file_path.name,
                 )
 
-                fidelities = required_fidelity(
+                source_fidelities = meta_numeric(
                     meta,
+                    "source_fidelity",
                     n,
-                    file_path=file_path,
+                    dtype=np.int32,
+                    default=-1,
                 )
 
                 true_shell_one = target_shell_np.astype(np.int64) + 1
@@ -1419,7 +1366,7 @@ def predict_cnp(
                     event_index_chunk = event_indices[event_start:event_end]
                     original_event_id_chunk = original_event_ids[event_start:event_end]
                     source_file_chunk = source_files[event_start:event_end]
-                    fidelity_chunk = fidelities[event_start:event_end]
+                    source_fidelity_chunk = source_fidelities[event_start:event_end]
                     true_shell_one_chunk = true_shell_one[event_start:event_end]
                     n_events_chunk = len(x_chunk)
 
@@ -1452,16 +1399,17 @@ def predict_cnp(
                             repeats=n_shells,
                         )
                         repeated_source_file = np.repeat(source_file_chunk, repeats=n_shells)
-                        repeated_fidelity = np.repeat(
-                            fidelity_chunk,
+                        repeated_source_fidelity = np.repeat(
+                            source_fidelity_chunk,
                             repeats=n_shells,
                         )
 
                         out = pd.DataFrame(
                             {
                                 "iteration": float(iteration),
-                                "fidelity": repeated_fidelity,
+                                "fidelity": float(fidelity),
                                 "source_file": repeated_source_file,
+                                "source_fidelity": repeated_source_fidelity,
                                 "event_index": repeated_event_index,
                                 "original_event_id": repeated_original_event_id,
                                 "shell_index": tiled_shell_index,
@@ -1498,8 +1446,9 @@ def predict_cnp(
                     best_chunk = pd.DataFrame(
                         {
                             "iteration": float(iteration),
-                            "fidelity": fidelity_chunk,
+                            "fidelity": float(fidelity),
                             "source_file": source_file_chunk,
+                            "source_fidelity": source_fidelity_chunk,
                             "event_index": event_index_chunk,
                             "original_event_id": original_event_id_chunk,
                             "true_shell_index": true_shell_one_chunk,
@@ -1533,7 +1482,7 @@ def predict_cnp(
                     agg_source = pd.DataFrame(
                         {
                             "iteration": float(iteration),
-                            "fidelity": np.repeat(fidelity_chunk, repeats=n_shells),
+                            "fidelity": float(fidelity),
                             "shell_index": tiled_shell_index,
                             "y_cnp": flat_y_cnp,
                             "y_cnp_err_sq": np.square(flat_y_cnp_err),
