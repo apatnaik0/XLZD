@@ -10,11 +10,6 @@ Shell construction:
 
 Target:
 - target_shell = zero-indexed shell class label
-
-Dataset split:
-- fidelity=0 events are all written to training/lf
-- fidelity=1 events are split between training/hf and validation/hf
-- split.validation_fraction controls the held-out fraction of HF events only
 """
 
 from __future__ import annotations
@@ -24,7 +19,6 @@ import json
 import shutil
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -47,8 +41,8 @@ if str(REPO_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from common.config import FileLoadConfig, DEFAULT_FILE_STEMS, SamplingConfig, OutputConfig, ShellConfig, EVENT_ID_COLUMN
-from common.dataset import split_pool_into_blocks
+from common.config import FileLoadConfig, DEFAULT_FILE_STEMS, SplitConfig, SamplingConfig, OutputConfig, ShellConfig, ShellPipelineConfig, EVENT_ID_COLUMN
+from common.dataset import split_into_disjoint_pools, split_pool_into_blocks
 from common.io_utils import load_event_file, save_dataframe
 from common.theta import add_centered_z_coordinate 
 from common.geometry import build_shell_table
@@ -60,63 +54,6 @@ TARGET_COLUMN = "target_shell"
 THETA_HEADERS = ["detector_R", "detector_Z"]
 PHI_HEADERS = ["s_r", "s_z_from_center"]
 MANIFEST_NAME = "file_manifest.csv"
-LOW_FIDELITY = 0
-HIGH_FIDELITY = 1
-VALID_FIDELITIES = {LOW_FIDELITY, HIGH_FIDELITY}
-
-
-@dataclass(frozen=True)
-class HFValidationSplitConfig:
-    """Configuration for holding out a fraction of high-fidelity events."""
-
-    validation_fraction: float = 0.4
-    random_seed: int = 42
-
-    def validate(self) -> None:
-        if not 0.0 <= self.validation_fraction < 1.0:
-            raise ValueError(
-                "split.validation_fraction must satisfy 0 <= value < 1. "
-                f"Got {self.validation_fraction}."
-            )
-
-
-@dataclass(frozen=True)
-class PreparationConfig:
-    file_load: FileLoadConfig
-    split: HFValidationSplitConfig
-    sampling: SamplingConfig
-    shell: ShellConfig
-    output: OutputConfig
-
-    def validate(self) -> None:
-        self.split.validate()
-        for section in (self.file_load, self.sampling, self.shell, self.output):
-            validate = getattr(section, "validate", None)
-            if callable(validate):
-                validate()
-
-
-def _validate_fidelity_series(values: pd.Series, *, context: str) -> pd.Series:
-    """Return integer fidelity values and reject anything other than 0 or 1."""
-    numeric = pd.to_numeric(values, errors="coerce")
-    invalid_numeric = numeric.isna() | ~np.isfinite(numeric.to_numpy(dtype=float))
-    non_integer = numeric.notna() & ~np.isclose(
-        numeric.to_numpy(dtype=float),
-        np.rint(numeric.to_numpy(dtype=float)),
-    )
-    invalid_binary = numeric.notna() & ~numeric.isin(VALID_FIDELITIES)
-    invalid = invalid_numeric | non_integer | invalid_binary
-
-    if invalid.any():
-        bad_rows = values.index[invalid].tolist()
-        bad_values = values.loc[invalid].tolist()
-        raise ValueError(
-            f"{context} contains invalid fidelity values at rows {bad_rows}: {bad_values}. "
-            "Fidelity must be exactly 0 (low fidelity) or 1 (high fidelity)."
-        )
-
-    return numeric.astype(np.int32)
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -149,9 +86,8 @@ def load_file_manifest(input_dir:Path, manifest_name: str = MANIFEST_NAME) -> pd
         R:        Maximum radius of the detector for this data file
         Z:        Maximum Z (half of height) of the detector for this data file
         z_center: Central Z - defines where the central z of the detector is to base z measurements from
-        fidelity: 0 for low fidelity or 1 for high fidelity
+        fidelity: Fidelity of this data file, normally based on number of events
 
-    Fidelity is required and must be exactly 0 or 1.
     R and Z are allowed to be blank and if so will be inferred from data
     """
     manifest_path = input_dir / manifest_name
@@ -171,10 +107,11 @@ def load_file_manifest(input_dir:Path, manifest_name: str = MANIFEST_NAME) -> pd
     manifest["R"] = pd.to_numeric(manifest["R"], errors="coerce")
     manifest["Z"] = pd.to_numeric(manifest["Z"], errors="coerce")
     manifest["z_center"] = pd.to_numeric(manifest["z_center"], errors="coerce")
-    manifest["fidelity"] = _validate_fidelity_series(
-        manifest["fidelity"],
-        context="file_manifest.csv",
-    )
+    manifest["fidelity"] = pd.to_numeric(manifest["fidelity"], errors="coerce")
+    if manifest["fidelity"].isna().any():
+        bad_rows = manifest.index[manifest["fidelity"].isna()].tolist()
+        raise ValueError(f"Manifest contains missing/non-numeric fidelity values at rows: {bad_rows}")
+    manifest["fidelity"] = manifest["fidelity"].astype(int)
     if manifest["filename"].isna().any() or (manifest["filename"] == "").any():
         raise ValueError("Manifest contains missing filename values.")
 
@@ -182,7 +119,7 @@ def load_file_manifest(input_dir:Path, manifest_name: str = MANIFEST_NAME) -> pd
     manifest["R"] = manifest["R"].astype(float)
     manifest["Z"] = manifest["Z"].astype(float)
     manifest["z_center"] = manifest["z_center"].astype(float)
-    manifest["fidelity"] = manifest["fidelity"].astype(np.int32)
+    manifest["fidelity"] = manifest["fidelity"].astype(int)
 
     return manifest
 
@@ -197,7 +134,7 @@ def get_manifest_file_path(input_dir: Path, file_name: str) -> Path:
     return path
 
 
-def build_config(args: argparse.Namespace) -> PreparationConfig:
+def build_config(args: argparse.Namespace) -> ShellPipelineConfig:
     raw = load_json_config(args.config)
     file_load = raw.get("file_load", {})
     split = raw.get("split", {})
@@ -205,21 +142,17 @@ def build_config(args: argparse.Namespace) -> PreparationConfig:
     shell = raw.get("shell", {})
     output = raw.get("output", {})
 
-    if "validation_fraction" not in split:
-        raise ValueError(
-            "Config must define split.validation_fraction. This is the fraction "
-            "of fidelity=1 events reserved for validation."
-        )
-
-    config = PreparationConfig(
+    config = ShellPipelineConfig(
         file_load=FileLoadConfig(
             input_dir=Path(file_load.get("input_dir", "data")),
             file_stems=file_load.get("file_stems", list(DEFAULT_FILE_STEMS)),
             max_rows_per_file=file_load.get("max_rows_per_file"),
         ),
-        split=HFValidationSplitConfig(
-            validation_fraction=float(split["validation_fraction"]),
+        split=SplitConfig(
+            lf_pool_fraction=float(split.get("lf_pool_fraction", 0.2)),
+            hf_pool_fraction=float(split.get("hf_pool_fraction", 0.4)),
             random_seed=int(split.get("random_seed", 42)),
+            stratify_by_component=bool(split.get("stratify_by_component", False)),
         ),
         sampling=SamplingConfig(
             hf_block_size=int(sampling.get("hf_block_size", 100000)),
@@ -251,7 +184,7 @@ def build_config(args: argparse.Namespace) -> PreparationConfig:
 def build_shell_config_for_manifest_row(
     row: pd.Series,
     base_shell_cfg: ShellConfig,
-) -> ShellConfig:
+) -> tuple[ShellConfig, str, str]:
     return ShellConfig(
         R_max=float(row["R"]),
         Z_max=float(row["Z"]),
@@ -274,78 +207,6 @@ def block_range(blocks: Sequence[pd.DataFrame]) -> tuple[int, int]:
         return 0,0
     sizes=[len(block) for block in blocks]
     return int(min(sizes)), int(max(sizes))
-
-
-
-def split_hf_training_validation(
-    events: pd.DataFrame,
-    *,
-    validation_fraction: float,
-    random_seed: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Keep every LF event for training and split only the HF events.
-
-    Fidelity is never assigned by this function. It is read from
-    ``file_manifest.csv`` and preserved unchanged:
-
-    - fidelity 0: all events go to LF training
-    - fidelity 1: ``validation_fraction`` goes to HF validation and the rest
-      goes to HF training
-    """
-    if "fidelity" not in events.columns:
-        raise ValueError("Events are missing the manifest-defined 'fidelity' column.")
-
-    events = events.copy()
-    events["fidelity"] = _validate_fidelity_series(
-        events["fidelity"],
-        context="Prepared events",
-    )
-
-    if not 0.0 <= float(validation_fraction) < 1.0:
-        raise ValueError(
-            "validation_fraction must satisfy 0 <= value < 1. "
-            f"Got {validation_fraction}."
-        )
-
-    lf_training = events[events["fidelity"] == LOW_FIDELITY].copy()
-    hf_events = events[events["fidelity"] == HIGH_FIDELITY].copy().reset_index(drop=True)
-
-    if hf_events.empty:
-        raise ValueError(
-            "No fidelity=1 events were found. HF data is required for HF training "
-            "and validation."
-        )
-
-    n_hf = len(hf_events)
-    n_validation = int(round(n_hf * float(validation_fraction)))
-
-    if validation_fraction > 0.0:
-        if n_hf < 2:
-            raise ValueError(
-                "At least two fidelity=1 events are required when "
-                "split.validation_fraction is greater than zero."
-            )
-        n_validation = min(max(1, n_validation), n_hf - 1)
-    else:
-        n_validation = 0
-
-    rng = np.random.default_rng(int(random_seed))
-    order = rng.permutation(n_hf)
-    validation_idx = order[:n_validation]
-    training_idx = order[n_validation:]
-
-    hf_training = hf_events.iloc[training_idx].copy().reset_index(drop=True)
-    hf_validation = hf_events.iloc[validation_idx].copy().reset_index(drop=True)
-    lf_training = lf_training.reset_index(drop=True)
-
-    print(f"[split] LF training (fidelity=0): {len(lf_training):,}")
-    print(f"[split] HF training (fidelity=1): {len(hf_training):,}")
-    print(
-        f"[split] HF validation (fidelity=1): {len(hf_validation):,} "
-        f"({validation_fraction:.2%} requested)"
-    )
-
-    return lf_training, hf_training, hf_validation
 
 
 def assign_shell_labels_for_file(
@@ -435,16 +296,19 @@ def write_h5_all_class_blocks(
     blocks: Sequence[pd.DataFrame],
     output_dir: Path,
     split_name: str,
-    file_prefix: str,
+    output_fidelity: str,
     theta_headers: Sequence[str],
     phi_headers: Sequence[str],
     n_shells: int,
 ) -> pd.DataFrame:
-    """Save one event-level categorical H5 file per block.
+    """
+    Save one event-level categorical H5 file per block.
 
-    Fidelity is not inferred from the output folder or block name.  Every H5
-    event receives the integer ``fidelity`` that was copied from
-    ``file_manifest.csv`` when its source file was loaded.
+    Each file contains:
+        phi:          [N_valid_events, phi_dim]
+        target_shell: [N_valid_events] int64, zero-based classes 0..n_shells-1
+
+    This is the correct format for weighted categorical cross entropy.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, object]] = []
@@ -455,30 +319,16 @@ def write_h5_all_class_blocks(
         TARGET_COLUMN,
         "shell_index",
         EVENT_ID_COLUMN,
-        "fidelity",
     }
-
+    
     for block_index, block_df in enumerate(blocks):
         if block_df.empty:
             continue
-
         missing = required_columns - set(block_df.columns)
         if missing:
             raise ValueError(
                 f"Block {block_index} is missing required columns: {sorted(missing)}"
             )
-
-        fidelity_values = _validate_fidelity_series(
-            block_df["fidelity"],
-            context=f"Block {block_index}",
-        ).to_numpy(dtype=np.int32)
-        unique_fidelities = np.unique(fidelity_values)
-        if len(unique_fidelities) != 1:
-            raise ValueError(
-                f"Block {block_index} mixes fidelities {unique_fidelities.tolist()}. "
-                "Blocks must be created within one manifest-defined fidelity."
-            )
-        block_fidelity = int(unique_fidelities[0])
 
         theta = block_df[list(theta_headers)].to_numpy(dtype=np.float32)
         phi = block_df[list(phi_headers)].to_numpy(dtype=np.float32)
@@ -488,7 +338,12 @@ def write_h5_all_class_blocks(
             if "source_file" in block_df.columns
             else np.asarray(["unknown"] * len(block_df))
         )
-
+        source_fidelity = (
+            block_df["source_fidelity"].to_numpy(dtype=np.int32)
+            if "source_fidelity" in block_df.columns
+            else np.full(len(block_df), -1, dtype=np.int32)
+        )
+        
         meta = {
             "event_index": block_df[EVENT_ID_COLUMN].to_numpy(dtype=np.int64),
             "original_event_id": (
@@ -498,14 +353,15 @@ def write_h5_all_class_blocks(
             ),
             "shell_index": block_df["shell_index"].to_numpy(dtype=np.int64),
             "source_file": np.asarray(source_file, dtype="S"),
-            "fidelity": fidelity_values,
+            "source_fidelity": source_fidelity,
             "split_name": np.asarray([split_name] * len(block_df), dtype="S"),
+            "output_fidelity": np.asarray([output_fidelity] * len(block_df), dtype="S"),
             "detector_R": block_df["detector_R"].to_numpy(dtype=np.float32),
             "detector_Z": block_df["detector_Z"].to_numpy(dtype=np.float32),
             "detector_z_center": block_df["detector_z_center"].to_numpy(dtype=np.float32),
         }
 
-        output_path = output_dir / f"{file_prefix}_block{block_index:04d}_event_classes.h5"
+        output_path = output_dir / f"{output_fidelity}_block{block_index:04d}_event_classes.h5"
 
         write_h5_class_block(
             output_path=output_path,
@@ -518,10 +374,11 @@ def write_h5_all_class_blocks(
         )
 
         class_counts = np.bincount(target_shell, minlength=n_shells)
+
         records.append(
             {
                 "split_name": split_name,
-                "fidelity": block_fidelity,
+                "fidelity": output_fidelity,
                 "block_index": block_index,
                 "file_name": output_path.name,
                 "file_path": str(output_path),
@@ -537,39 +394,37 @@ def write_h5_all_class_blocks(
 
     return pd.DataFrame.from_records(records)
 
+
 def print_summary(
     *,
     files_loaded: list[Path],
     total_events_loaded: int,
-    lf_training_pool: pd.DataFrame,
-    hf_training_pool: pd.DataFrame,
-    hf_validation_pool: pd.DataFrame,
-    block_summaries: dict[str, dict[str, int | tuple[int, int]]],
+    pool_sizes: dict[str, int],
+    block_counts: dict[str, int],
+    block_size_ranges: dict[str, tuple[int, int]],
+    leftover_rows: dict[str, int],
     shell_cfg: ShellConfig,
-    validation_fraction: float,
 ) -> None:
     print("\n=== XLZD Cylindrical Shell Summary ===")
     print(f"Total files loaded: {len(files_loaded)}")
     print(f"Total events loaded: {total_events_loaded:,}")
     print(f"Shell classes: {shell_cfg.n_shells:,}")
-    print(f"LF training events (fidelity=0): {len(lf_training_pool):,}")
-    print(f"HF training events (fidelity=1): {len(hf_training_pool):,}")
-    print(f"HF validation events (fidelity=1): {len(hf_validation_pool):,}")
-    print(f"Requested HF validation fraction: {validation_fraction:.2%}")
 
-    for label, info in block_summaries.items():
-        size_range = info["size_range"]
-        print(
-            f"{label}: blocks={info['block_count']}, "
-            f"block_size_range={size_range[0]}-{size_range[1]}, "
-            f"unused_leftover_rows={info['leftover_rows']}"
-        )
+    print(
+        f"Pool sizes: LF={pool_sizes['lf']:,}, HF={pool_sizes['hf']:,}, VAL={pool_sizes['validation']:,}")
+    print(
+        f"Block counts: n(LF)={block_counts['lf']}, m(HF)={block_counts['hf']}, k(VAL)={block_counts['validation']}")
+    print(
+        f"Block size ranges: "
+        f"LF={block_size_ranges['lf'][0]}-{block_size_ranges['lf'][1]}, "
+        f"HF={block_size_ranges['hf'][0]}-{block_size_ranges['hf'][1]}, "
+        f"VAL={block_size_ranges['validation'][0]}-{block_size_ranges['validation'][1]}")
+    print(f"Unused leftover rows: LF={leftover_rows['lf']}, HF={leftover_rows['hf']}, VAL={leftover_rows['validation']}")
 
 
 def main() -> None:
     args = parse_args()
     config = build_config(args)
-    validation_fraction = config.split.validation_fraction
     total_start = time.perf_counter()
 
     input_dir = config.file_load.input_dir
@@ -597,42 +452,41 @@ def main() -> None:
 
     for manifest_index, row in input_manifest.iterrows():
         source_name = str(row["filename"])
-        fidelity = int(row["fidelity"])
+        source_fidelity = int(row["fidelity"])
         data_path = get_manifest_file_path(input_dir, source_name)
 
         print("\n" + "=" * 80)
-        print(f"Processing manifest row {manifest_index + 1}")
+        print(f"Processing manifest row {manifest_index+1}")
         print(f"source_file={source_name}")
         print(f"manifest R={row.get('R')}, Z={row.get('Z')}")
-        print(f"fidelity={fidelity}")
+        print(f"source_fidelity={source_fidelity}")
         print("=" * 80)
 
         stage_start = log_stage(f"Loading {data_path.name}")
         events = load_event_file(
             data_path,
-            max_rows=config.file_load.max_rows_per_file,
-        )
+            max_rows=config.file_load.max_rows_per_file)
         finish_stage(stage_start, f"Loaded {len(events):,} rows")
 
         files_loaded.append(data_path)
         total_events_loaded += int(len(events))
         shell_cfg = build_shell_config_for_manifest_row(row, config.shell)
 
-        stage_start = log_stage("Using detector geometry and fidelity from manifest")
+        stage_start = log_stage("Using detector geometry from manifest")
         detector_R = float(shell_cfg.R_max)
         detector_Z = float(shell_cfg.Z_max)
         z_center = float(shell_cfg.z_center)
         events = add_centered_z_coordinate(events, z_center)
 
         events["source_file"] = source_name
-        events["fidelity"] = fidelity
+        events["source_fidelity"] = source_fidelity
         events["detector_R"] = detector_R
         events["detector_Z"] = detector_Z
         events["detector_z_center"] = z_center
 
         finish_stage(
             stage_start,
-            f"Using manifest values: fidelity={fidelity}, "
+            f"Using manifest geometry: "
             f"z_center={z_center:.6g}, R={detector_R:.6g}, Z={detector_Z:.6g}",
         )
 
@@ -640,12 +494,11 @@ def main() -> None:
         shell_table_df = build_shell_table(events, shell_cfg)
         shell_table_out = shell_table_df.copy()
         shell_table_out["source_file"] = source_name
-        shell_table_out["fidelity"] = fidelity
+        shell_table_out["source_fidelity"] = source_fidelity
         shell_table_out["detector_R"] = detector_R
         shell_table_out["detector_Z"] = detector_Z
         shell_table_out["detector_z_center"] = z_center
         shell_table_parts.append(shell_table_out)
-
         labeled_events = assign_shell_labels_for_file(
             events=events,
             shell_table_df=shell_table_df,
@@ -658,32 +511,16 @@ def main() -> None:
 
         labeled_event_parts.append(labeled_events)
         del events, labeled_events, shell_table_df
-
-    stage_start = log_stage("Concatenating labeled events across all detector geometries")
+    
+    stage_start = log_stage("Concatenating labeled events across all theta values")
     if not labeled_event_parts:
         raise RuntimeError("No labeled events were produced from the manifest.")
-
     all_events = pd.concat(labeled_event_parts, ignore_index=True, sort=False)
     all_events["mixed_event_index"] = np.arange(len(all_events), dtype=np.int64)
     all_events[EVENT_ID_COLUMN] = all_events["mixed_event_index"]
-    all_events["fidelity"] = _validate_fidelity_series(
-        all_events["fidelity"],
-        context="Combined prepared events",
-    )
     finish_stage(
         stage_start,
         f"Combined labeled event table has {len(all_events):,} rows",
-    )
-
-    stage_start = log_stage("Splitting only high-fidelity events for validation")
-    lf_training_pool, hf_training_pool, hf_validation_pool = split_hf_training_validation(
-        all_events,
-        validation_fraction=validation_fraction,
-        random_seed=config.split.random_seed,
-    )
-    finish_stage(
-        stage_start,
-        f"HF split complete (validation_fraction={validation_fraction:.4f})",
     )
 
     validation_block_size = (
@@ -692,65 +529,81 @@ def main() -> None:
         else config.sampling.validation_block_size
     )
 
-    pool_specs = (
-        (
-            "LF training",
-            lf_training_pool,
-            output_dir / "training" / "lf",
-            "training",
-            "lf",
-            config.sampling.lf_block_size,
-        ),
-        (
-            "HF training",
-            hf_training_pool,
-            output_dir / "training" / "hf",
-            "training",
-            "hf",
-            config.sampling.hf_block_size,
-        ),
-        (
-            "HF validation",
-            hf_validation_pool,
-            output_dir / "validation" / "hf",
-            "validation",
-            "hf",
-            validation_block_size,
-        ),
-    )
+    stage_start = log_stage("Splitting combined labeled events into LF/HF/validation pools")
+    pools = split_into_disjoint_pools(all_events, config.split)
+    finish_stage(stage_start, "Pool split complete")
 
-    manifest_parts: list[pd.DataFrame] = []
-    block_summaries: dict[str, dict[str, int | tuple[int, int]]] = {}
+    stage_start = log_stage("Splitting combined pools into equal-size event blocks")
+    lf_blocks = split_pool_into_blocks(
+        pools.lf_pool,
+        block_size=config.sampling.lf_block_size)
+    hf_blocks = split_pool_into_blocks(
+        pools.hf_pool,
+        block_size=config.sampling.hf_block_size)
+    validation_blocks = split_pool_into_blocks(
+        pools.validation_pool,
+        block_size=validation_block_size)
+    lf_blocks_list = list(lf_blocks.blocks)
+    hf_blocks_list = list(hf_blocks.blocks)
+    validation_blocks_list = list(validation_blocks.blocks)
+    finish_stage(stage_start, "Pool block split complete")
 
-    for label, pool_df, pool_output_dir, split_name, file_prefix, block_size in pool_specs:
-        stage_start = log_stage(f"Writing {label} event-class H5 blocks")
-        block_result = split_pool_into_blocks(pool_df, block_size=block_size)
-        blocks = list(block_result.blocks)
+    pool_sizes = {
+        "lf": int(len(pools.lf_pool)),
+        "hf": int(len(pools.hf_pool)),
+        "validation": int(len(pools.validation_pool))}
+    block_counts = {
+        "lf": int(len(lf_blocks_list)),
+        "hf": int(len(hf_blocks_list)),
+        "validation": int(len(validation_blocks_list))}
+    leftover_rows = {
+        "lf": int(lf_blocks.leftover_rows),
+        "hf": int(hf_blocks.leftover_rows),
+        "validation": int(validation_blocks.leftover_rows)}
+    block_size_ranges = {
+        "lf": block_range(lf_blocks_list),
+        "hf": block_range(hf_blocks_list),
+        "validation": block_range(validation_blocks_list)}
+    
+    stage_start = log_stage("Writing LF Training event-class H5 blocks")
+    lf_manifest = write_h5_all_class_blocks(
+        blocks=lf_blocks_list,
+        output_dir=output_dir / "training" / "lf",
+        split_name="training",
+        output_fidelity="lf",
+        theta_headers=THETA_HEADERS,
+        phi_headers=PHI_HEADERS,
+        n_shells=config.shell.n_shells)
+    finish_stage(stage_start, f"{len(lf_manifest)} LF Training blocks written")
 
-        block_manifest = write_h5_all_class_blocks(
-            blocks=blocks,
-            output_dir=pool_output_dir,
-            split_name=split_name,
-            file_prefix=file_prefix,
-            theta_headers=THETA_HEADERS,
-            phi_headers=PHI_HEADERS,
-            n_shells=config.shell.n_shells,
-        )
-        if not block_manifest.empty:
-            manifest_parts.append(block_manifest)
+    stage_start = log_stage("Writing HF Training event-class H5 blocks")
+    hf_manifest = write_h5_all_class_blocks(
+        blocks=hf_blocks_list,
+        output_dir=output_dir / "training" / "hf",
+        split_name="training",
+        output_fidelity="hf",
+        theta_headers=THETA_HEADERS,
+        phi_headers=PHI_HEADERS,
+        n_shells=config.shell.n_shells)
+    finish_stage(stage_start, f"{len(hf_manifest)} HF Training blocks written")
 
-        block_summaries[label] = {
-            "block_count": int(len(blocks)),
-            "size_range": block_range(blocks),
-            "leftover_rows": int(block_result.leftover_rows),
-        }
-        finish_stage(stage_start, f"{len(block_manifest)} {label} blocks written")
+    stage_start = log_stage("Writing HF Validation event-class H5 blocks")
+    val_manifest = write_h5_all_class_blocks(
+        blocks=validation_blocks_list,
+        output_dir=output_dir / "validation" / "hf",
+        split_name="validation",
+        output_fidelity="hf",
+        theta_headers=THETA_HEADERS,
+        phi_headers=PHI_HEADERS,
+        n_shells=config.shell.n_shells)
+    finish_stage(stage_start, f"{len(val_manifest)} HF Validation blocks written")
 
     stage_start = log_stage("Writing pool tables and manifests")
+
     save_dataframe(all_events, output_dir / "processed_all_events", output_format)
-    save_dataframe(lf_training_pool, output_dir / "lf_training_pool", output_format)
-    save_dataframe(hf_training_pool, output_dir / "hf_training_pool", output_format)
-    save_dataframe(hf_validation_pool, output_dir / "hf_validation_pool", output_format)
+    save_dataframe(pools.lf_pool, output_dir / "lf_training_pool", output_format)
+    save_dataframe(pools.hf_pool, output_dir / "hf_training_pool", output_format)
+    save_dataframe(pools.validation_pool, output_dir / "hf_validation_pool", output_format)
 
     if shell_table_parts:
         shell_table_by_theta = pd.concat(shell_table_parts, ignore_index=True, sort=False)
@@ -763,40 +616,38 @@ def main() -> None:
         output_format,
     )
 
-    manifest_df = (
-        pd.concat(manifest_parts, ignore_index=True, sort=False)
-        if manifest_parts
-        else pd.DataFrame()
+    manifest_df = pd.concat(
+        [lf_manifest, hf_manifest, val_manifest],
+        ignore_index=True,
     )
+
     manifest_path = save_dataframe(
         manifest_df,
         output_dir / "event_class_manifest",
         output_format,
     )
+
     finish_stage(stage_start, "Output files written")
 
     print_summary(
         files_loaded=files_loaded,
         total_events_loaded=total_events_loaded,
-        lf_training_pool=lf_training_pool,
-        hf_training_pool=hf_training_pool,
-        hf_validation_pool=hf_validation_pool,
-        block_summaries=block_summaries,
+        pool_sizes=pool_sizes,
+        block_counts=block_counts,
+        block_size_ranges=block_size_ranges,
+        leftover_rows=leftover_rows,
         shell_cfg=config.shell,
-        validation_fraction=validation_fraction,
     )
 
     print(
         f"\nArtifacts:"
         f"\n- shell table by theta: {shell_table_path}"
         f"\n- manifest: {manifest_path}"
-        f"\n- training H5 root: {output_dir / 'training'}"
-        f"\n- validation H5 root: {output_dir / 'validation'}"
     )
 
     total_elapsed = time.perf_counter() - total_start
     print(f"\nTotal elapsed: {total_elapsed:.2f}s")
-
+      
 
 if __name__ == "__main__":
     main()
