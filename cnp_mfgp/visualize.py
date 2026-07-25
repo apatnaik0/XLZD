@@ -210,15 +210,18 @@ def plot_cnp_pred_shell_occupancy(
     outpath: str | Path | None = None,
 ) -> tuple[plt.Figure, list[plt.Axes]]:
     """
-    Plot predicted vs true shell histograms from predict_cnp output
+    Plot predicted, summed probabilities vs true shell histograms from a predict_cnp output
 
     Uses:
-        predict_result.best_path
+        predict_result.best_path for predicted shells
+        predict_result.mfgp_path for summed probabilities
     """
-    # Take the data we want
-    data = pd.read_csv(predict_result.best_path)
-    pred_shells = data["predicted_shell_index"].to_numpy(dtype=np.int16)
-    true_shells = data["true_shell_index"].to_numpy(dtype=np.int16)
+    # -----------
+    # Event-level best-shell data
+    # -----------
+    best_data = pd.read_csv(predict_result.best_path)
+    pred_shells = best_data["predicted_shell_index"].to_numpy(dtype=np.int16)
+    true_shells = best_data["true_shell_index"].to_numpy(dtype=np.int16)
 
     # Filter if truth values exist. For emulated data it doesnt so just pass
     has_truth_vals = np.any(true_shells >= 0)
@@ -229,47 +232,100 @@ def plot_cnp_pred_shell_occupancy(
     else:
         true_shells = None
 
-    # Plot - depending if truth values exist
+    # -----------
+    # Summed Probability Data
+    # -----------
+    prob_data = pd.read_csv(predict_result.mfgp_path)
+    required_columns = {"shell_index", "y_cnp", "n_samples"}
+    missing_columns = required_columns - set(prob_data.columns)
+    if missing_columns:
+        raise ValueError(f"MFGP CSV is missing required columns: {sorted(missing_columns)}")
+    for column in required_columns:
+        prob_data[column] = pd.to_numeric(prob_data[column], errors="coerce")
+    if prob_data[list(required_columns)].isna().any().any():
+        raise ValueError("MFGP CSV contains missing or non-numeric probability values.")
+
+    # y_cnp is the mean shell probability across n_sampled events
+    # Multiplying restores the total expected count for that shell/group
+    prob_data["prob_sum"] = prob_data["y_cnp"] * prob_data["n_samples"]
+    summed_probs = prob_data.groupby("shell_index")["prob_sum"].sum().sort_index()
+
+    # Include every shell, even if one is absent from the grouped frame.
+    shell_end_candidates = [int(pred_shells.max()), int(summed_probs.index.max()),]
+    if true_shells is not None:
+        shell_end_candidates.append(int(true_shells.max()))
+    shell_end = max(shell_end_candidates)
+    shell_numbers = np.arange(1, shell_end + 1)
+
+    summed_probs = (
+        summed_probs
+        .reindex(shell_numbers, fill_value=0.0)
+        .to_numpy(dtype=float)
+    )
+    
+    # The summed prob should be approx equal to the # of events represented in the prediction
+    total_diff = summed_probs.sum() - len(pred_shells)
+    print(f"Probabilty-Sum minus event count: {total_diff:,.2f}")
+
+    # -----------
+    # Plot
+    # -----------
     if true_shells is None:
-        shell_end = pred_shells.max()
-
-        fig, ax = plt.subplots(figsize=(12,4))
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        ax1.bar(
+            shell_numbers,
+            summed_probs,
+            width=0.9,
+            edgecolor="black")
+        ax1.set_title("Summed Predicted Shell Probabilities")
+        ax1.set_xlabel("Shell Number")
+        ax1.set_ylabel("Expected Count")
+        ax1.grid(True, alpha=0.3)
         plot_shell_histogram(
             pred_shells,
             shell_end=shell_end,
-            title="Predicted Shell Distribution",
-            ax=ax,
-        )
-        axes = [ax]
-    else: 
-        # Grab maximum shell between the two
-        shell_end = max(
-            pred_shells.max(),
-            true_shells.max(),
-        )
+            title="Argmax Predicted Shell Distribution",
+            ax=ax2)
+        fig.suptitle("CNP Argmax vs Summed Probability Distribution", fontsize=14)
+        axes = [ax1, ax2]
 
-        fig, (ax1, ax2) = plt.subplots(2,1,figsize=(12,8),sharex=True)
+    else:
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
+        # Fractional contribution from every event to every shell.
+        ax1.bar(
+            shell_numbers,
+            summed_probs,
+            width=0.9,
+            edgecolor="black")
+        ax1.set_title("Summed Predicted Shell Probabilities")
+        ax1.set_ylabel("Expected Count")
+        ax1.grid(True, alpha=0.3)
+        # One count per event at the most probable shell.
         plot_shell_histogram(
             pred_shells,
             shell_end=shell_end,
-            title="Predicted Shell Distribution",
-            ax=ax1,
-        )
+            title="Argmax Predicted Shell Distribution",
+            ax=ax2)
+        # Exact true shell counts.
         plot_shell_histogram(
             true_shells,
             shell_end=shell_end,
             title="True Shell Distribution",
-            ax=ax2,
-        )
-    
-        # Clean up
-        fig.suptitle("CNP Predicted vs True Shell Distribution", fontsize=14)
-        axes = [ax1, ax2]
-    
-    
+            ax=ax3)
+        fig.suptitle("CNP Predicted vs True Shell Distribution",fontsize=14)
+        axes = [ax1, ax2, ax3]
+
+    # Ensure the full shell range is visible.
+    for ax in axes:
+        ax.set_xlim(0.5, shell_end + 0.5)
     fig.tight_layout()
     if outpath is not None:
-        fig.savefig(outpath, dpi=200)
+        outpath = Path(outpath)
+        outpath.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(
+            outpath,
+            dpi=200,
+            bbox_inches="tight")
     return fig, axes
 
 def plot_input_shell_occupancy(

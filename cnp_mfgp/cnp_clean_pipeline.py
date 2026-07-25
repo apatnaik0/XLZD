@@ -988,7 +988,7 @@ def train_cnp(
     loss_kwargs = {
         "sigma": 1.25,
         "hard_fraction": 0.5,
-        "class_weights": class_weights
+        #"class_weights": class_weights
     }
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
