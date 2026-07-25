@@ -726,10 +726,6 @@ def _plot_train_val_shell_probability_snapshot(
     For each event:
         true shell probability      = softmax probability at the true class
         wrong shell probabilities   = softmax probabilities at all non-true classes
-
-    This mirrors the old plot:
-        true label = 1
-        wrong labels = 0
     """
     train_probs = F.softmax(train_logits.detach(), dim=-1).cpu().numpy()
     val_probs = F.softmax(val_logits.detach(), dim=-1).cpu().numpy()
@@ -907,7 +903,54 @@ def _plot_sample_shell_predictions(
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
+
+def loss_function(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    sigma: float=1.25,
+    hard_fraction: float=0.8,
+    class_weights: Optional[torch.Tensor]=None
+) -> torch.Tensor:
+    """
+    Function that defines what the loss of the model is going to be. Made a separate function so its easy to change and shift.
+
+    Current structure:
+        One-Hot targetting added to Gaussian Blurred near-shell measurement
+
+        sigma: width of the gaussian in units of shell index
+        hard_fraction: how much of the total loss should be weighted toward one hot targetting? 
+            1 -> normal hard cross entropy
+            0 -> entirely gaussian smoothed
+    """
+    if sigma <= 0:
+        raise ValueError("sigma must be greater than zero.")
+
+    if not 0.0 <= hard_fraction <= 1.0:
+        raise ValueError("hard_fraction must be between 0 and 1.")
+
+    target = target.long().reshape(-1)
+    n_shells = logits.shape[-1]
     
+    shell_indices = torch.arange(n_shells, device=logits.device, dtype=logits.dtype)
+    distances = shell_indices.unsqueeze(0) - target.to(logits.dtype).unsqueeze(1)
+    gaussian_target = torch.exp(-0.5 * torch.square(distances/sigma))
+    
+    # Normalize the events gaussian sum to 1
+    gaussian_target = gaussian_target/gaussian_target.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    hard_target = F.one_hot(target, num_classes=n_shells).to(dtype=logits.dtype)
+    soft_target = hard_fraction * hard_target + (1.0-hard_fraction) * gaussian_target
+
+    log_probabilities = F.log_softmax(logits, dim=-1)
+    per_event_loss = -torch.sum(soft_target*log_probabilities, dim=-1)
+
+    if class_weights is not None:
+        # Weight each event based on its actual true shell
+        sample_weights = class_weights[target]
+        return torch.sum(sample_weights*per_event_loss) / sample_weights.sum().clamp_min(1e-12)
+
+    return per_event_loss.mean()
+    
+
 def train_cnp(
     runtime: CNPRuntimeConfig,
     steps_per_epoch: Optional[int] = None,
@@ -942,7 +985,11 @@ def train_cnp(
     model.to(dev)
 
     class_weights = compute_shell_class_weights(pool, n_shells=runtime.n_shells, beta=0.5, max_weight=20.0).to(dev)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    loss_kwargs = {
+        "sigma": 1.25,
+        "hard_fraction": 0.5,
+        "class_weights": class_weights
+    }
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     rng = np.random.default_rng(runtime.seed)
@@ -1020,7 +1067,7 @@ def train_cnp(
                 context_mode=runtime.context_mode,
             )
             logits, _sigma = model(cx, cy, tx)
-            train_loss = criterion(logits, ty)
+            train_loss = loss_function(logits, ty, **loss_kwargs)
 
             optimizer.zero_grad()
             train_loss.backward()
@@ -1047,7 +1094,7 @@ def train_cnp(
                 )
             
                 vlogits, _vsigma = model(vcx, vcy, vtx)
-                val_loss = criterion(vlogits, vty)
+                val_loss = loss_function(vlogits, vty, **loss_kwargs)
             
                 pred_shell = torch.argmax(logits, dim=-1)
                 val_pred_shell = torch.argmax(vlogits, dim=-1)
