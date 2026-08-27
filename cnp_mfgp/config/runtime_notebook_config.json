@@ -9,8 +9,8 @@
     "stratify_by_component": false
   },
   "sampling": {
-    "hf_block_size": 100000,
-    "lf_block_size": 20000,
+    "hf_block_size": 10000,
+    "lf_block_size": 2000,
     "validation_block_size": null,
     "progress": true
   },

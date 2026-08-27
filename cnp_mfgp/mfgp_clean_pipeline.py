@@ -34,6 +34,8 @@ import numpy as np
 import pandas as pd
 import yaml
 from matplotlib.lines import Line2D
+from matplotlib.ticker import FuncFormatter, ScalarFormatter
+from matplotlib.colors import LogNorm
 from sklearn.decomposition import PCA
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
@@ -210,33 +212,40 @@ def load_mfgp_training_data(
     csv_path: str | Path,
     x_cols: Sequence[str],
     iteration: int = 0,
+    shell_n: int = 20,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int, int]:
     df = pd.read_csv(csv_path)
-    df = _aggregate_rows(df, x_cols)
+
+    # First aggregate duplicate rows while KEEPING shell identity
+    df = _aggregate_rows(df, [*x_cols, SHELL_COLUMN])
+    
+    # Select this iteration
     df = df[df["iteration"].astype(int) == int(iteration)].copy()
     if df.empty:
         raise ValueError(f"No rows found for iteration={iteration}")
 
-    selected_lf, selected_hf = _resolve_fidelity_pair(
-        df["fidelity"].astype(int).unique().tolist()
-    )
+    # Human-selected containment region:
+    # shell 1 through shell_n
+    df = df[df[SHELL_COLUMN].astype(int) <= int(shell_n)].copy()
+    if df.empty:
+        raise ValueError(f"No shell rows found for shell_n={shell_n}")
+
+    # Collapse shells 1...n into ONE scalar probability for each geometry/fidelity.
+    group_cols = [*x_cols, "fidelity", "iteration"]
+    df = (df.groupby(group_cols, as_index=False).agg(y_cnp=("y_cnp", "sum"), y_raw=("y_raw", "sum"),
+            # approximate uncertainty combination
+            y_cnp_err=("y_cnp_err", lambda x: np.sqrt(np.sum(np.square(x)))), n_samples_agg=("n_samples_agg", "sum"),))
+    selected_lf, selected_hf = _resolve_fidelity_pair(df["fidelity"].astype(int).unique().tolist())
+
     lf = df[df["fidelity"].astype(int) == selected_lf].copy()
     hf = df[df["fidelity"].astype(int) == selected_hf].copy()
-
-    if lf.empty or hf.empty:
-        raise ValueError(
-            f"Need both selected fidelities at iteration={iteration}. "
-            f"Found fidelity {selected_lf}: {len(lf)} rows; "
-            f"fidelity {selected_hf}: {len(hf)} rows."
-        )
-
     for column in x_cols:
         lf[column] = lf[column].astype(float)
         hf[column] = hf[column].astype(float)
     lf["y_cnp"] = lf["y_cnp"].astype(float)
     lf["y_cnp_err"] = lf["y_cnp_err"].astype(float)
     hf["y_raw"] = hf["y_raw"].astype(float)
-
+    
     return df, lf, hf, selected_lf, selected_hf
 
 
@@ -360,7 +369,7 @@ class CleanAutoregressiveMFGP:
 
         mu_hf = self.rho * mu_lf + mu_d
         var_hf = (self.rho ** 2) * (std_lf ** 2) + (std_d ** 2)
-        std_hf = np.sqrt(np.maximum(var_hf, 1e-12))
+        std_hf = np.maximum(np.sqrt(np.maximum(var_hf, 0.0)), 1e-12)
 
         return mu_hf, std_hf, mu_lf, std_lf
 
@@ -1173,7 +1182,7 @@ def _plot_mean_std_heatmaps(
     *,
     title: str = "MF-GP high-fidelity prediction",
 ) -> None:
-    """Plot only the physical R>=0, Z>=0 quadrant.
+    """Plot the physical R>=0, Z>=0 quadrant starting at (0, 0).
 
     ``std_hf`` is the one-sigma half-width in the displayed target space. Each
     overlaid marker is one unique HF theta point; no mirrored copies are made.
@@ -1210,12 +1219,42 @@ def _plot_mean_std_heatmaps(
         if len(points):
             points = np.unique(points, axis=0)
 
+    def prepare_log_contour(values: np.ndarray, intervals: int = 24) -> tuple[np.ndarray, np.ndarray, LogNorm, float]:
+        """Return plotting values/levels for a true logarithmic contour map.
+
+        LogNorm requires strictly-positive values.  Zero or negative values are
+        floored only for visualization; the underlying MF-GP predictions are
+        not modified.  Geometric contour levels make each color band represent
+        an equal interval in log space.
+        """
+        arr = np.asarray(values, dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            raise ValueError("Cannot plot a contour map containing no finite values")
+
+        eps = _choose_log_plot_eps(finite)
+        plot_values = np.maximum(arr, eps)
+        positive = plot_values[np.isfinite(plot_values) & (plot_values > 0.0)]
+        vmin = float(np.min(positive))
+        vmax = float(np.max(positive))
+
+        if vmax <= vmin * (1.0 + 1e-12):
+            # LogNorm needs a non-degenerate positive range.
+            vmin = max(vmin / 1.01, eps)
+            vmax = max(vmax * 1.01, vmin * 1.01)
+
+        levels = np.geomspace(vmin, vmax, int(intervals) + 1)
+        return plot_values, levels, LogNorm(vmin=vmin, vmax=vmax), eps
+
+    Zm_plot, mean_levels, mean_norm, mean_eps = prepare_log_contour(Zm)
+    Zs_plot, std_levels, std_norm, std_eps = prepare_log_contour(Zs)
+
     fig, axes = plt.subplots(1, 2, figsize=(16, 6.8), constrained_layout=True)
 
-    mean_levels = 24 if np.nanmax(Zm) > np.nanmin(Zm) else 2
-    std_levels = 24 if np.nanmax(Zs) > np.nanmin(Zs) else 2
-    im_mean = axes[0].contourf(gx, gy, Zm, levels=mean_levels, cmap="viridis")
-    im_std = axes[1].contourf(gx, gy, Zs, levels=std_levels, cmap="Reds")
+    # Geometrically-spaced levels plus LogNorm produce a true logarithmic color
+    # distribution, making structure at low HF values much easier to see.
+    im_mean = axes[0].contourf(gx, gy, Zm_plot, levels=mean_levels, norm=mean_norm, cmap="viridis")
+    im_std = axes[1].contourf(gx, gy, Zs_plot, levels=std_levels, norm=std_norm, cmap="Reds")
 
     for axis in axes:
         if points is not None and len(points):
@@ -1233,14 +1272,82 @@ def _plot_mean_std_heatmaps(
             axis.legend(loc="best", fontsize=8, frameon=True)
         axis.set_xlabel(x_cols[0])
         axis.set_ylabel(x_cols[1])
-        axis.set_xlim(left=max(0.0, float(gx.min())))
-        axis.set_ylim(bottom=max(0.0, float(gy.min())))
+        axis.set_xlim(0.0, float(gx.max()))
+        axis.set_ylim(0.0, float(gy.max()))
         axis.grid(alpha=0.16)
 
     axes[0].set_title("Predicted HF mean")
     axes[1].set_title("Predicted HF 1σ uncertainty")
-    fig.colorbar(im_mean, ax=axes[0], label="prediction")
-    fig.colorbar(im_std, ax=axes[1], label="1σ half-width")
+
+    def _concise_colorbar(cbar, values: np.ndarray, label: str) -> None:
+        """Use a small number of easy-to-read colorbar ticks."""
+        finite = np.asarray(values, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            cbar.set_label(label)
+            return
+
+        vmin = float(np.min(finite))
+        vmax = float(np.max(finite))
+        center = 0.5 * (vmin + vmax)
+        span = vmax - vmin
+        magnitude = max(abs(center), 1e-300)
+
+        def _compact(value: float, sig: int = 2) -> str:
+            if value == 0.0:
+                return '0'
+            av = abs(value)
+            if av >= 1e3 or av < 1e-2:
+                return f"{value:.{sig-1}e}".replace('.0e', 'e')
+            return f"{value:.{sig}g}"
+
+        def _unique_ticklabels(ticks: np.ndarray) -> list[str]:
+            ticks = np.asarray(ticks, dtype=float)
+            for sig in (2, 3, 4, 5):
+                labels = [_compact(v, sig=sig) for v in ticks]
+                if len(set(labels)) == len(labels):
+                    return labels
+            return [_compact(v, sig=5) for v in ticks]
+
+        # If the map varies only a tiny amount around a much larger baseline,
+        # show the colorbar as an offset from that baseline.
+        if span > 0.0 and span / magnitude < 1e-4:
+            base = float(f"{center:.6g}")
+            delta_max = max(abs(vmin - base), abs(vmax - base))
+            if delta_max > 0.0:
+                exponent = int(np.floor(np.log10(delta_max)))
+                scale = 10.0 ** exponent
+                ticks = np.linspace(vmin, vmax, 5)
+                cbar.set_ticks(ticks)
+                cbar.set_ticklabels([
+                    f"{(value - base) / scale:.2f}".rstrip('0').rstrip('.') for value in ticks
+                ])
+                cbar.set_label(f"{label} (offset from {_compact(base, sig=4)}, ×10^{exponent})")
+                return
+
+        # Otherwise show only a few logarithmically spaced ticks.
+        ticks = np.geomspace(vmin, vmax, 5) if vmax > vmin else np.array([vmin])
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels(_unique_ticklabels(ticks))
+        cbar.set_label(label)
+
+    cbar_mean = fig.colorbar(im_mean, ax=axes[0])
+    cbar_std = fig.colorbar(im_std, ax=axes[1])
+    _concise_colorbar(cbar_mean, Zm_plot, "prediction")
+    _concise_colorbar(cbar_std, Zs_plot, "1σ half-width")
+
+    # Make the visualization-only floor explicit when non-positive values exist.
+    if np.any(~np.isfinite(Zm) | (Zm <= 0.0)):
+        axes[0].text(
+            0.01, 0.01, f"plot floor = {mean_eps:.2e}", transform=axes[0].transAxes,
+            fontsize=8, va="bottom", ha="left",
+        )
+    if np.any(~np.isfinite(Zs) | (Zs <= 0.0)):
+        axes[1].text(
+            0.01, 0.01, f"plot floor = {std_eps:.2e}", transform=axes[1].transAxes,
+            fontsize=8, va="bottom", ha="left",
+        )
+
     fig.suptitle(title, fontsize=14)
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
@@ -1772,29 +1879,38 @@ def _positive_prediction_grid(
             f"found {runtime.theta_headers}"
         )
     combined = np.vstack([x_lf, x_hf]).astype(float)
-    observed_lower = np.nanmin(combined, axis=0)
     observed_upper = np.nanmax(combined, axis=0)
 
-    configured_lower = np.asarray(runtime.theta_min, dtype=float) if len(runtime.theta_min) == 2 else observed_lower
-    configured_upper = np.asarray(runtime.theta_max, dtype=float) if len(runtime.theta_max) == 2 else observed_upper
-    configured_valid = (
-        np.all(np.isfinite(configured_lower))
-        and np.all(np.isfinite(configured_upper))
-        and np.all(configured_upper > configured_lower)
-        and np.all(observed_lower >= configured_lower - 1e-9)
+    # These maps represent detector dimensions, so always include the physical
+    # lower bound R=0, Z=0 even when the smallest training geometry is larger.
+    lower = np.zeros(2, dtype=float)
+
+    configured_upper = (
+        np.asarray(runtime.theta_max, dtype=float)
+        if len(runtime.theta_max) == 2
+        else observed_upper
+    )
+    configured_upper_valid = (
+        np.all(np.isfinite(configured_upper))
+        and np.all(configured_upper > lower)
         and np.all(observed_upper <= configured_upper + 1e-9)
     )
-    lower = configured_lower if configured_valid else observed_lower
-    upper = configured_upper if configured_valid else observed_upper
-    lower = np.maximum(lower, 0.0)
-    if np.any(upper <= lower):
+    upper = configured_upper if configured_upper_valid else observed_upper
+
+    if np.any(~np.isfinite(upper)) or np.any(upper <= lower):
         raise ValueError(
             "Cannot construct a positive R-Z grid. Need non-degenerate positive "
             f"bounds, got lower={lower.tolist()}, upper={upper.tolist()}."
         )
+
+    # Pad the visible/the predicted region slightly beyond the maximum theta so
+    # HF points near the boundary are not drawn flush against the edge.
+    pad = np.array([100.0, 100.0], dtype=float)
+    upper = upper + pad
+
     n = max(2, int(points_per_axis))
-    axis0 = np.linspace(lower[0], upper[0], n)
-    axis1 = np.linspace(lower[1], upper[1], n)
+    axis0 = np.linspace(0.0, upper[0], n)
+    axis1 = np.linspace(0.0, upper[1], n)
     gx, gy = np.meshgrid(axis0, axis1, indexing="xy")
     return np.column_stack([gx.ravel(), gy.ravel()])
 
@@ -1834,20 +1950,56 @@ def _load_validation_hf_points(
     validation_csv: str | Path,
     x_cols: Sequence[str],
     iteration: int,
+    shell_n: int = 20,
 ) -> pd.DataFrame:
+    """Load HF validation targets using the same shell<=n containment target as training.
+
+    The validation CSV contains one row per shell.  We must therefore preserve
+    ``shell_index`` during duplicate aggregation, select shells 1..shell_n, and
+    SUM their probabilities.  Aggregating only by theta would average over all
+    shells, which drives every normalized y_raw target toward 1 / n_shells.
+    """
     path = Path(validation_csv).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"Validation CNP CSV not found: {path}")
-    frame = _aggregate_rows(pd.read_csv(path), x_cols)
+
+    # Keep shell identity first, exactly as load_mfgp_training_data() does.
+    frame = _aggregate_rows(
+        pd.read_csv(path),
+        [*x_cols, SHELL_COLUMN],
+    )
+
     frame = frame[frame["iteration"].astype(int) == int(iteration)].copy()
     if frame.empty:
         raise ValueError(f"No validation rows found for iteration={iteration}: {path}")
+
+    # Match the scalar target used to train the MF-GP:
+    # P(shell <= shell_n) = sum_{shell=1..shell_n} P(shell).
+    frame = frame[frame[SHELL_COLUMN].astype(int) <= int(shell_n)].copy()
+    if frame.empty:
+        raise ValueError(
+            f"No validation shell rows found for shell_n={shell_n}, "
+            f"iteration={iteration}: {path}"
+        )
+
+    group_cols = [*x_cols, "fidelity", "iteration"]
+    frame = (
+        frame.groupby(group_cols, as_index=False)
+        .agg(
+            y_cnp=("y_cnp", "sum"),
+            y_raw=("y_raw", "sum"),
+            y_cnp_err=("y_cnp_err", lambda x: np.sqrt(np.sum(np.square(x)))),
+            n_samples_agg=("n_samples_agg", "sum"),
+        )
+    )
+
     fidelities = sorted(frame["fidelity"].astype(int).unique().tolist())
     if FIDELITY_HF not in fidelities:
         raise ValueError(
             "Validation CSV must contain fidelity=1 HF rows; "
             f"found fidelities {fidelities}."
         )
+
     return (
         frame[frame["fidelity"].astype(int) == FIDELITY_HF]
         .sort_values(list(x_cols), kind="mergesort")
@@ -1896,9 +2048,16 @@ def _plot_validation_hf_points(
     y_pred, lower, upper = _prediction_interval_in_output_space(
         mean_model, std_model, use_log_hf=use_log_hf, sigma=1.0
     )
+    # Plot this comparison on a logarithmic y axis.  Probabilities at or below
+    # zero cannot appear on a log axis, so floor them for plotting only.
+    eps = _choose_log_plot_eps(y_true, y_pred, lower, upper)
+    y_true_plot = np.maximum(y_true, eps)
+    y_pred_plot = np.maximum(y_pred, eps)
+    lower_plot = np.maximum(lower, eps)
+    upper_plot = np.maximum(upper, y_pred_plot)
     yerr = np.vstack([
-        np.maximum(y_pred - lower, 0.0),
-        np.maximum(upper - y_pred, 0.0),
+        np.maximum(y_pred_plot - lower_plot, 0.0),
+        np.maximum(upper_plot - y_pred_plot, 0.0),
     ])
     idx = np.arange(len(validation), dtype=int)
 
@@ -1906,11 +2065,11 @@ def _plot_validation_hf_points(
     fig, ax = plt.subplots(figsize=(fig_width, 6.2))
 
     # The connector is the residual; the error bar is the model uncertainty.
-    ax.vlines(idx, y_true, y_pred, color="0.60", lw=1.1, alpha=0.8, label="truth-to-prediction residual")
-    ax.scatter(idx, y_true, marker="x", s=48, color="black", linewidth=1.3, label="HF truth")
+    ax.vlines(idx, y_true_plot, y_pred_plot, color="0.60", lw=1.1, alpha=0.8, label="truth-to-prediction residual")
+    ax.scatter(idx, y_true_plot, marker="x", s=48, color="black", linewidth=1.3, label="HF truth")
     ax.errorbar(
         idx,
-        y_pred,
+        y_pred_plot,
         yerr=yerr,
         fmt="o",
         ms=5,
@@ -1934,9 +2093,15 @@ def _plot_validation_hf_points(
         ax.set_xlabel(f"HF point index (sorted by {', '.join(x_cols)})")
 
     inside = (y_true >= lower) & (y_true <= upper)
-    ax.set_ylabel("HF target / MF-GP prediction")
+    ax.set_yscale("log")
+    ax.set_ylabel("HF target / MF-GP prediction (log scale)")
     ax.set_title(f"{title}\nEach marker is one unique validation HF theta point")
-    ax.grid(True, alpha=0.25)
+    ax.grid(True, which="both", alpha=0.25)
+    if np.any(~np.isfinite(y_true) | (y_true <= 0.0) | ~np.isfinite(y_pred) | (y_pred <= 0.0)):
+        ax.text(
+            0.01, 0.01, f"plot floor = {eps:.2e}", transform=ax.transAxes,
+            fontsize=8, va="bottom", ha="left",
+        )
     handles, legend_labels = ax.get_legend_handles_labels()
     extra = Line2D([0], [0], color="none", label=f"within 1σ: {int(inside.sum())}/{len(inside)}")
     ax.legend(handles + [extra], legend_labels + [extra.get_label()], loc="best", fontsize=8, frameon=True)
@@ -1954,19 +2119,28 @@ def _plot_validation_parity_pointwise(
     use_log_hf: bool,
     title: str,
 ) -> None:
+    """Validation parity plot with logarithmic x and y axes."""
     y_true = np.asarray(y_true, dtype=float)
     y_pred, lower, upper = _prediction_interval_in_output_space(
         mean_model, std_model, use_log_hf=use_log_hf, sigma=1.0
     )
+
+    # Log axes require strictly-positive coordinates.  Keep all model/truth
+    # values untouched and apply a floor only to the displayed coordinates.
+    eps = _choose_log_plot_eps(y_true, y_pred, lower, upper)
+    y_true_plot = np.maximum(y_true, eps)
+    y_pred_plot = np.maximum(y_pred, eps)
+    lower_plot = np.maximum(lower, eps)
+    upper_plot = np.maximum(upper, y_pred_plot)
     yerr = np.vstack([
-        np.maximum(y_pred - lower, 0.0),
-        np.maximum(upper - y_pred, 0.0),
+        np.maximum(y_pred_plot - lower_plot, 0.0),
+        np.maximum(upper_plot - y_pred_plot, 0.0),
     ])
 
     fig, ax = plt.subplots(figsize=(6.8, 6.4))
     ax.errorbar(
-        y_true,
-        y_pred,
+        y_true_plot,
+        y_pred_plot,
         yerr=yerr,
         fmt="o",
         ms=5,
@@ -1976,28 +2150,39 @@ def _plot_validation_parity_pointwise(
         ecolor="tab:blue",
         alpha=0.82,
     )
-    lo = float(min(np.min(y_true), np.min(lower)))
-    hi = float(max(np.max(y_true), np.max(upper)))
-    if np.isclose(lo, hi):
-        pad = max(abs(lo) * 0.05, 1e-6)
-        lo, hi = lo - pad, hi + pad
+
+    lo = float(min(np.min(y_true_plot), np.min(lower_plot)))
+    hi = float(max(np.max(y_true_plot), np.max(upper_plot)))
+    if hi <= lo * (1.0 + 1e-12):
+        lo = max(lo / 1.1, eps)
+        hi = max(hi * 1.1, lo * 1.1)
+
     ax.plot([lo, hi], [lo, hi], "k--", lw=1.0, label="perfect prediction")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
-    ax.set_xlabel("HF truth (y_raw)")
-    ax.set_ylabel("MF-GP prediction")
+    ax.set_xlabel("HF truth (y_raw, log scale)")
+    ax.set_ylabel("MF-GP prediction (log scale)")
     ax.set_title(f"{title}\nValidation parity with ±1σ prediction uncertainty")
-    ax.grid(True, alpha=0.28)
+    ax.grid(True, which="both", alpha=0.28)
+    if np.any(~np.isfinite(y_true) | (y_true <= 0.0) | ~np.isfinite(y_pred) | (y_pred <= 0.0)):
+        ax.text(
+            0.03, 0.97, f"plot floor = {eps:.2e}", transform=ax.transAxes,
+            fontsize=8, va="top", ha="left",
+        )
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
+
 
 def run_clean_mfgp(
     config_path: str | Path,
     cnp_csv: Optional[str | Path] = None,
     validation_csv: Optional[str | Path] = None,
     iteration: int = 0,
+    shell_n: int = 20,
     target_transform: str = "linear",
     log_epsilon: Optional[float] = None,
     grid_points_per_axis: int = 120,
@@ -2051,6 +2236,7 @@ def run_clean_mfgp(
         cnp_csv_path,
         x_cols=x_cols,
         iteration=iteration,
+        shell_n=shell_n,
     )
 
     default_minimum = _minimum_point_count(len(x_cols))
@@ -2076,7 +2262,12 @@ def run_clean_mfgp(
 
     validation_hf: Optional[pd.DataFrame] = None
     if val_csv_path is not None:
-        validation_hf = _load_validation_hf_points(val_csv_path, x_cols, iteration)
+        validation_hf = _load_validation_hf_points(
+            val_csv_path,
+            x_cols,
+            iteration,
+            shell_n=shell_n,
+        )
         _validate_unique_point_count(
             validation_hf,
             x_cols,
@@ -2228,6 +2419,7 @@ def run_clean_mfgp(
         "cnp_csv": str(cnp_csv_path),
         "validation_csv": str(val_csv_path) if val_csv_path is not None else None,
         "iteration": int(iteration),
+        "shell_n": int(shell_n),
         "target_transform": transform_mode,
         "use_log_lf": bool(use_log_lf),
         "use_log_hf": bool(use_log_hf),
@@ -2252,6 +2444,7 @@ def run_clean_mfgp(
     metrics_json = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_metrics_iter{iteration}.json"
     metrics_json.write_text(json.dumps({
         "transform": transform_mode,
+        "shell_n": int(shell_n),
         "training": training_metrics,
         "validation": validation_metrics,
         "n_lf_points": int(len(lf)),
@@ -2312,6 +2505,7 @@ def run_mfgp_transform_suite(
     validation_csv: Optional[str | Path] = None,
     transforms: Sequence[str] = ("linear", "log_hf", "log_lf", "log_both"),
     iteration: int = 0,
+    shell_n: int = 20,
     log_epsilon: Optional[float] = None,
     grid_points_per_axis: int = 120,
     random_state: int = 42,
@@ -2337,6 +2531,7 @@ def run_mfgp_transform_suite(
             cnp_csv=cnp_csv,
             validation_csv=validation_csv,
             iteration=iteration,
+            shell_n=shell_n,
             target_transform=mode,
             log_epsilon=log_epsilon,
             grid_points_per_axis=grid_points_per_axis,
@@ -2356,6 +2551,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cnp-csv", type=str, default=None, help="Optional explicit CNP output CSV")
     p.add_argument("--validation-csv", type=str, default=None, help="Optional explicit validation CSV for extra plots")
     p.add_argument("--iteration", type=int, default=0, help="Iteration value to filter")
+    p.add_argument("--shell-n", type=int, default=20, help="Containment target: train/validate on P(shell < inner-n)")
     p.add_argument(
         "--target-transform",
         type=str,
@@ -2385,6 +2581,7 @@ def main() -> None:
             cnp_csv=args.cnp_csv,
             validation_csv=args.validation_csv,
             iteration=args.iteration,
+            shell_n=args.shell_n,
             log_epsilon=args.log_epsilon,
             grid_points_per_axis=args.grid_points,
             random_state=args.random_state,
@@ -2398,6 +2595,7 @@ def main() -> None:
         cnp_csv=args.cnp_csv,
         validation_csv=args.validation_csv,
         iteration=args.iteration,
+        shell_n=args.shell_n,
         target_transform=args.target_transform,
         log_epsilon=args.log_epsilon,
         grid_points_per_axis=args.grid_points,

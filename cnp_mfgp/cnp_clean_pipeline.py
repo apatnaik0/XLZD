@@ -584,8 +584,6 @@ class TrainResult:
 
 @dataclass
 class PredictResult:
-    all_path: Path
-    best_path: Path
     mfgp_path: Path
 
 def split_context_target_class(
@@ -1274,7 +1272,6 @@ def predict_cnp(
     output_epochs: Optional[int] = None,
     chunk_size: int = 20000,
     device: Optional[str] = None,
-    all_shells: bool = False,
 ) -> PredictResult:
     runtime.out_dir.mkdir(parents=True, exist_ok=True)
     set_seed(runtime.seed)
@@ -1294,45 +1291,17 @@ def predict_cnp(
     n_shells = runtime.n_shells
     shell_indices = np.arange(1, n_shells + 1, dtype=np.int32)
 
-    # MFGP focused csv output
+    # Aggregated event-shell distribution used by the downstream MFGP.
     mfgp_csv = (
         runtime.out_dir / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs.csv"
     )
 
-    # Diagnostic csv outputs
-    all_shell_csv = (
-        runtime.out_dir / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs_all_shells.csv"
-    )
-    best_shell_csv = (
-        runtime.out_dir
-        / f"cnp_{runtime.version}_{output_suffix}_{output_epochs}epochs_best_shell.csv"
-    )
-    for path in [mfgp_csv, all_shell_csv, best_shell_csv]:
-        if path.exists():
-            path.unlink()
+    if mfgp_csv.exists():
+        mfgp_csv.unlink()
 
-    write_all_header = True
-    write_best_header = True
     total_event_count = 0
 
     agg_chunks: list[pd.DataFrame] = []
-
-    def meta_numeric(
-        meta: dict[str, np.ndarray],
-        key: str,
-        n: int,
-        dtype: np.dtype | type,
-        default: int | float,
-    ) -> np.ndarray:
-        if key not in meta:
-            return np.full(n, default, dtype=dtype)
-
-        arr = np.asarray(meta[key]).reshape(-1)
-
-        if len(arr) != n:
-            return np.full(n, default, dtype=dtype)
-
-        return arr.astype(dtype)
 
     def required_fidelity(
         meta: dict[str, np.ndarray],
@@ -1352,31 +1321,9 @@ def predict_cnp(
             context=f"{file_path.name} meta/fidelity",
         )
 
-    def meta_strings(
-        meta: dict[str, np.ndarray],
-        key: str,
-        n: int,
-        default: str,
-    ) -> np.ndarray:
-        if key not in meta:
-            return np.asarray([default] * n, dtype=object)
-
-        arr = np.asarray(meta[key]).reshape(-1)
-
-        if len(arr) != n:
-            return np.asarray([default] * n, dtype=object)
-
-        return np.asarray(
-            [
-                item.decode("utf-8") if isinstance(item, (bytes, np.bytes_)) else str(item)
-                for item in arr
-            ],
-            dtype=object,
-        )
-
     print("\n" + "=" * 80)
     print("Starting CNP prediction")
-    print(f"Save all-shell CSV: {all_shells}")
+    print("Output: aggregated MFGP shell-distribution CSV")
     print("=" * 80)
 
     for i, pred_dir in enumerate(runtime.predict_dirs):
@@ -1423,31 +1370,6 @@ def predict_cnp(
                 context_y_idx = torch.from_numpy(target_shell_np[c_idx]).long().to(dev)
                 context_y = F.one_hot(context_y_idx, num_classes=n_shells).float()
 
-                event_indices = meta_numeric(
-                    meta,
-                    "event_index",
-                    n,
-                    dtype=np.int64,
-                    default=0,
-                )
-                if "event_index" not in meta:
-                    event_indices = np.arange(n, dtype=np.int64)
-
-                original_event_ids = meta_numeric(
-                    meta,
-                    "original_event_id",
-                    n,
-                    dtype=np.int64,
-                    default=-1,
-                )
-
-                source_files = meta_strings(
-                    meta,
-                    "source_file",
-                    n,
-                    default=file_path.name,
-                )
-
                 fidelities = required_fidelity(
                     meta,
                     n,
@@ -1463,9 +1385,6 @@ def predict_cnp(
 
                     x_chunk = x_np[event_start:event_end]
                     theta_chunk = x_chunk[:, :theta_dim]
-                    event_index_chunk = event_indices[event_start:event_end]
-                    original_event_id_chunk = original_event_ids[event_start:event_end]
-                    source_file_chunk = source_files[event_start:event_end]
                     fidelity_chunk = fidelities[event_start:event_end]
                     true_shell_one_chunk = true_shell_one[event_start:event_end]
                     n_events_chunk = len(x_chunk)
@@ -1492,91 +1411,8 @@ def predict_cnp(
                     flat_y_cnp_err = stds.reshape(-1)
                     flat_y_raw = (tiled_shell_index == repeated_true_shell).astype(np.float32)
 
-                    if all_shells:
-                        repeated_event_index = np.repeat(event_index_chunk, repeats=n_shells)
-                        repeated_original_event_id = np.repeat(
-                            original_event_id_chunk,
-                            repeats=n_shells,
-                        )
-                        repeated_source_file = np.repeat(source_file_chunk, repeats=n_shells)
-                        repeated_fidelity = np.repeat(
-                            fidelity_chunk,
-                            repeats=n_shells,
-                        )
-
-                        out = pd.DataFrame(
-                            {
-                                "iteration": float(iteration),
-                                "fidelity": repeated_fidelity,
-                                "source_file": repeated_source_file,
-                                "event_index": repeated_event_index,
-                                "original_event_id": repeated_original_event_id,
-                                "shell_index": tiled_shell_index,
-                                "true_shell_index": repeated_true_shell,
-                                "y_cnp": flat_y_cnp,
-                                "y_cnp_err": flat_y_cnp_err,
-                            }
-                        )
-
-                        for theta_col, theta_name in enumerate(runtime.theta_headers):
-                            out[theta_name] = np.repeat(
-                                theta_chunk[:, theta_col],
-                                repeats=n_shells,
-                            )
-
-                        out["y_raw"] = flat_y_raw
-
-                        # Already normalized by softmax.
-                        out["p_shell"] = out["y_cnp"]
-
-                        out.to_csv(
-                            all_shell_csv,
-                            mode="w" if write_all_header else "a",
-                            header=write_all_header,
-                            index=False,
-                        )
-                        write_all_header = False
-
-                        del out
-
-                    best_zero = np.argmax(probs, axis=1)
-                    best_one = best_zero + 1
-
-                    best_chunk = pd.DataFrame(
-                        {
-                            "iteration": float(iteration),
-                            "fidelity": fidelity_chunk,
-                            "source_file": source_file_chunk,
-                            "event_index": event_index_chunk,
-                            "original_event_id": original_event_id_chunk,
-                            "true_shell_index": true_shell_one_chunk,
-                            "predicted_shell_index": best_one.astype(np.int32),
-                            "predicted_shell_probability": probs[
-                                np.arange(n_events_chunk),
-                                best_zero,
-                            ],
-                            "predicted_shell_score": probs[
-                                np.arange(n_events_chunk),
-                                best_zero,
-                            ],
-                            "y_cnp_err": stds[np.arange(n_events_chunk), best_zero],
-                        }
-                    )
-
-                    for theta_col, theta_name in enumerate(runtime.theta_headers):
-                        best_chunk[theta_name] = theta_chunk[:, theta_col]
-
-                    best_chunk.to_csv(
-                        best_shell_csv,
-                        mode="w" if write_best_header else "a",
-                        header=write_best_header,
-                        index=False,
-                    )
-                    write_best_header = False
-
-                    # Build the smallest possible frame needed for MFGP aggregation.
-                    # This keeps the MFGP output unchanged, but avoids materializing the
-                    # large diagnostic all-shell DataFrame when all_shells=False.
+                    # Build the event-shell rows needed only for grouped MFGP aggregation.
+                    # No per-event all-shell or argmax/best-shell CSV is written.
                     agg_source = pd.DataFrame(
                         {
                             "iteration": float(iteration),
@@ -1612,7 +1448,7 @@ def predict_cnp(
 
                     total_event_count += n_events_chunk
 
-                    del best_chunk, agg_source, probs, stds, target_x
+                    del agg_source, probs, stds, target_x
                     del tiled_shell_index, repeated_true_shell, flat_y_cnp, flat_y_cnp_err, flat_y_raw
 
                     if "agg_chunk" in locals():
@@ -1686,19 +1522,10 @@ def predict_cnp(
         pd.DataFrame(columns=required_cols).to_csv(mfgp_csv, index=False)
 
     print("\n" + "=" * 80)
-    print(f"MFGP CSV:       {mfgp_csv}")
-    if all_shells:
-        print(f"All-shell CSV:  {all_shell_csv}")
-    else:
-        print("All-shell CSV:  not saved (all_shells=False)")
-    print(f"Best-shell CSV: {best_shell_csv}")
+    print(f"MFGP CSV: {mfgp_csv}")
     print("=" * 80)
 
-    return PredictResult(
-        all_path=all_shell_csv if all_shells else None,
-        best_path=best_shell_csv,
-        mfgp_path=mfgp_csv,
-    )
+    return PredictResult(mfgp_path=mfgp_csv)
 
 # -----------------------------
 # Experiment wrappers
@@ -1722,12 +1549,7 @@ def _experiment_result_dict(
         "history_plot": str(train_result.history_plot),
         "sample_plot": str(train_result.sample_plot),
 
-        "train_all_shell_csv": str(predict_result_train.all_path),
-        "train_best_shell_csv": str(predict_result_train.best_path),
         "train_mfgp_csv": str(predict_result_train.mfgp_path),
-
-        "validation_all_shell_csv": str(predict_result_validation.all_path),
-        "validation_best_shell_csv": str(predict_result_validation.best_path),
         "validation_mfgp_csv": str(predict_result_validation.mfgp_path),
     }
 
@@ -2009,8 +1831,6 @@ def main() -> None:
         )
 
         print(json.dumps({
-            "all_shell_csv": str(result.all_path),
-            "best_shell_csv": str(result.best_path),
             "mfgp_csv": str(result.mfgp_path),
         }, indent=2))
 
@@ -2046,8 +1866,6 @@ def main() -> None:
             "history_plot": str(train_result.history_plot),
             "sample_plot": str(train_result.sample_plot),
 
-            "all_shell_csv": str(predict_result.all_path),
-            "best_shell_csv": str(predict_result.best_path),
             "mfgp_csv": str(predict_result.mfgp_path),
         }, indent=2))
 

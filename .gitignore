@@ -3,6 +3,7 @@ data/**
 !data/.gitkeep
 !data/**/
 !data/**/.gitkeep
+old_data/**
 
 # Generated outputs
 archive/outputs/**
@@ -14,6 +15,8 @@ archive/outputs_smoke/**
 !archive/outputs_smoke/.gitkeep
 !archive/outputs_smoke/**/
 !archive/outputs_smoke/**/.gitkeep
+
+archive/xlzd_data
 
 cnp_mfgp/outputs/**
 !cnp_mfgp/outputs/.gitkeep
