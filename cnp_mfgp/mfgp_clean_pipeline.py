@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import joblib
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,7 @@ from sklearn.preprocessing import StandardScaler
 FIDELITY_LF = 0
 FIDELITY_HF = 1
 SHELL_COLUMN = "shell_index"
+MFGP_CHECKPOINT_FORMAT = "clean_autoregressive_mfgp_v1"
 
 
 @dataclass
@@ -778,6 +780,7 @@ def _plot_distribution_predictions(
 @dataclass
 class MFGPResult:
     cnp_csv: Path
+    model_path: Path
     model_json: Path
     metrics_json: Path
     prediction_csv: Path
@@ -1867,6 +1870,218 @@ def _prediction_interval_in_output_space(
     return center, lower, upper
 
 
+
+def save_mfgp_checkpoint(
+    model: CleanAutoregressiveMFGP,
+    model_path: str | Path,
+    *,
+    version: str,
+    theta_headers: Sequence[str],
+    iteration: int,
+    shell_n: int,
+    target_transform: str,
+    log_epsilon: float,
+    use_log_lf: bool,
+    use_log_hf: bool,
+    selected_lf: int,
+    selected_hf: int,
+    theta_min: Optional[Sequence[float]] = None,
+    theta_max: Optional[Sequence[float]] = None,
+) -> Path:
+    """Serialize the fully fitted MF-GP and all metadata needed for inference."""
+    model_path = Path(model_path).expanduser().resolve()
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if model.gp_lf is None or model.gp_d is None:
+        raise RuntimeError("Cannot save an MF-GP before model.fit() has completed")
+
+    bundle = {
+        "checkpoint_format": MFGP_CHECKPOINT_FORMAT,
+        "model": model,
+        "version": str(version),
+        "theta_headers": list(theta_headers),
+        "iteration": int(iteration),
+        "shell_n": int(shell_n),
+        "target_transform": _target_transform_suffix(target_transform),
+        "log_epsilon": float(log_epsilon),
+        "use_log_lf": bool(use_log_lf),
+        "use_log_hf": bool(use_log_hf),
+        "selected_lf": int(selected_lf),
+        "selected_hf": int(selected_hf),
+        "random_state": int(model.random_state),
+        "alpha_lf": float(model.alpha_lf),
+        "alpha_hf": float(model.alpha_hf),
+        "theta_min": (
+            None if theta_min is None else [float(value) for value in theta_min]
+        ),
+        "theta_max": (
+            None if theta_max is None else [float(value) for value in theta_max]
+        ),
+    }
+    joblib.dump(bundle, model_path)
+    return model_path
+
+
+def load_mfgp_checkpoint(model_path: str | Path) -> dict:
+    """Load a fully fitted MF-GP checkpoint created by ``save_mfgp_checkpoint``."""
+    model_path = Path(model_path).expanduser().resolve()
+    if not model_path.exists():
+        raise FileNotFoundError(f"MF-GP checkpoint does not exist: {model_path}")
+
+    bundle = joblib.load(model_path)
+    if not isinstance(bundle, dict):
+        raise ValueError(f"Invalid MF-GP checkpoint {model_path}: expected a dictionary bundle")
+
+    if bundle.get("checkpoint_format") != MFGP_CHECKPOINT_FORMAT:
+        raise ValueError(
+            f"Unsupported MF-GP checkpoint format {bundle.get('checkpoint_format')!r}; "
+            f"expected {MFGP_CHECKPOINT_FORMAT!r}."
+        )
+
+    required = {
+        "model",
+        "theta_headers",
+        "iteration",
+        "shell_n",
+        "target_transform",
+        "log_epsilon",
+        "use_log_lf",
+        "use_log_hf",
+    }
+    missing = sorted(required - set(bundle))
+    if missing:
+        raise ValueError(f"MF-GP checkpoint {model_path} is missing fields: {missing}")
+
+    model = bundle["model"]
+    if not isinstance(model, CleanAutoregressiveMFGP):
+        raise TypeError(
+            f"MF-GP checkpoint model has type {type(model).__name__}, "
+            "expected CleanAutoregressiveMFGP."
+        )
+    if model.gp_lf is None or model.gp_d is None:
+        raise ValueError("MF-GP checkpoint contains an unfitted model")
+
+    return bundle
+
+
+def predict_mfgp_checkpoint(
+    model_path: str | Path,
+    theta: np.ndarray | pd.DataFrame,
+    *,
+    sigma: float = 1.0,
+    chunk_size: int = 20000,
+) -> pd.DataFrame:
+    """Predict directly from a saved MF-GP without any re-fitting.
+
+    Parameters
+    ----------
+    model_path:
+        ``.joblib`` file written by ``save_mfgp_checkpoint``.
+    theta:
+        Either an ``(N, theta_dim)`` ndarray or a dataframe containing the
+        checkpoint's ``theta_headers``.
+    sigma:
+        Width of the returned prediction interval.
+    """
+    bundle = load_mfgp_checkpoint(model_path)
+    model: CleanAutoregressiveMFGP = bundle["model"]
+    theta_headers = list(bundle["theta_headers"])
+
+    if isinstance(theta, pd.DataFrame):
+        missing = sorted(set(theta_headers) - set(theta.columns))
+        if missing:
+            raise ValueError(f"Prediction dataframe is missing theta columns: {missing}")
+        x = theta[theta_headers].to_numpy(dtype=float)
+        out = theta[theta_headers].copy().reset_index(drop=True)
+    else:
+        x = np.asarray(theta, dtype=float)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        if x.ndim != 2 or x.shape[1] != len(theta_headers):
+            raise ValueError(
+                f"Expected theta shape (N, {len(theta_headers)}) for {theta_headers}, got {x.shape}"
+            )
+        out = pd.DataFrame(x, columns=theta_headers)
+
+    mean_model, std_model = _predict_in_chunks(model, x, chunk_size)
+    prediction, lower, upper = _prediction_interval_in_output_space(
+        mean_model,
+        std_model,
+        use_log_hf=bool(bundle["use_log_hf"]),
+        sigma=float(sigma),
+    )
+
+    out["mf_mean_model_space"] = mean_model
+    out["mf_std_model_space"] = std_model
+    out["mf_prediction"] = prediction
+    out[f"mf_lower_{sigma:g}sigma"] = lower
+    out[f"mf_upper_{sigma:g}sigma"] = upper
+    return out
+
+
+def evaluate_mfgp_checkpoint(
+    model_path: str | Path,
+    validation_csv: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    metrics_json: str | Path | None = None,
+    chunk_size: int = 20000,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Evaluate a saved MF-GP on a held-out CNP aggregate CSV with no fitting."""
+    bundle = load_mfgp_checkpoint(model_path)
+    x_cols = list(bundle["theta_headers"])
+    iteration = int(bundle["iteration"])
+    shell_n = int(bundle["shell_n"])
+
+    validation_hf = _load_validation_hf_points(
+        validation_csv,
+        x_cols=x_cols,
+        iteration=iteration,
+        shell_n=shell_n,
+    )
+    x_val = validation_hf[x_cols].to_numpy(dtype=float)
+
+    model: CleanAutoregressiveMFGP = bundle["model"]
+    mean_model, std_model = _predict_in_chunks(model, x_val, chunk_size)
+    y_true = validation_hf["y_raw"].to_numpy(dtype=float)
+    prediction, lower, upper = _prediction_interval_in_output_space(
+        mean_model,
+        std_model,
+        use_log_hf=bool(bundle["use_log_hf"]),
+        sigma=1.0,
+    )
+
+    metrics = _regression_metrics_with_coverage(
+        y_true,
+        prediction,
+        mean_model,
+        std_model,
+        use_log_hf=bool(bundle["use_log_hf"]),
+    )
+
+    out = validation_hf[x_cols + ["y_raw"]].copy()
+    out["mf_mean_model_space"] = mean_model
+    out["mf_std_model_space"] = std_model
+    out["mf_prediction"] = prediction
+    out["mf_lower_1sigma"] = lower
+    out["mf_upper_1sigma"] = upper
+    out["residual"] = prediction - y_true
+    out["absolute_residual"] = np.abs(out["residual"])
+    out["within_1sigma"] = (y_true >= lower) & (y_true <= upper)
+
+    if output_csv is not None:
+        output_csv = Path(output_csv).expanduser().resolve()
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        out.to_csv(output_csv, index=False)
+
+    if metrics_json is not None:
+        metrics_json = Path(metrics_json).expanduser().resolve()
+        metrics_json.parent.mkdir(parents=True, exist_ok=True)
+        metrics_json.write_text(json.dumps(metrics, indent=2))
+
+    return out, metrics
+
+
 def _positive_prediction_grid(
     runtime: MFGPRuntimeConfig,
     x_lf: np.ndarray,
@@ -2308,6 +2523,26 @@ def run_clean_mfgp(
         verbose=verbose,
     )
 
+    model_path = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_model_iter{iteration}.joblib"
+    save_mfgp_checkpoint(
+        model,
+        model_path,
+        version=runtime.version,
+        theta_headers=x_cols,
+        iteration=iteration,
+        shell_n=shell_n,
+        target_transform=transform_mode,
+        log_epsilon=eps,
+        use_log_lf=use_log_lf,
+        use_log_hf=use_log_hf,
+        selected_lf=selected_lf,
+        selected_hf=selected_hf,
+        theta_min=runtime.theta_min,
+        theta_max=runtime.theta_max,
+    )
+    if verbose:
+        print(f"[saved] MF-GP checkpoint: {model_path}")
+
     hf_mean_model, hf_std_model = _predict_in_chunks(model, x_hf, predict_chunk_size)
     hf_pred, _, _ = _prediction_interval_in_output_space(
         hf_mean_model, hf_std_model, use_log_hf=use_log_hf
@@ -2415,6 +2650,8 @@ def run_clean_mfgp(
     model_json = runtime.out_dir_mfgp / f"mfgp_{artifact_tag}_model_iter{iteration}.json"
     model_json.write_text(json.dumps({
         "version": runtime.version,
+        "checkpoint_path": str(model_path),
+        "checkpoint_format": MFGP_CHECKPOINT_FORMAT,
         "config_path": str(runtime.config_path),
         "cnp_csv": str(cnp_csv_path),
         "validation_csv": str(val_csv_path) if val_csv_path is not None else None,
@@ -2473,6 +2710,7 @@ def run_clean_mfgp(
 
     return MFGPResult(
         cnp_csv=cnp_csv_path,
+        model_path=model_path,
         model_json=model_json,
         metrics_json=metrics_json,
         prediction_csv=pred_csv,

@@ -35,6 +35,7 @@ from tqdm.auto import tqdm
 LOW_FIDELITY = 0
 HIGH_FIDELITY = 1
 VALID_FIDELITIES = {LOW_FIDELITY, HIGH_FIDELITY}
+CNP_CHECKPOINT_FORMAT = "deterministic_cnp_v2_portable_context"
 
 
 def _validate_binary_fidelity_array(
@@ -94,6 +95,7 @@ class CNPRuntimeConfig:
     ratio_testing_vs_training: float
     plot_after: int
     seed: int
+    scale_power: float = 1.0 / 3.0
 
 
 def _as_float_fraction(value: object, default: float) -> float:
@@ -153,6 +155,7 @@ def load_runtime_config(
         ratio_testing_vs_training=_as_float_fraction(cnp.get("ratio_testing_vs_training", "1/40"), default=1 / 40),
         plot_after=int(cnp.get("plot_after", 1000)),
         seed=seed,
+        scale_power=float(sim.get("scale_power", 1.0 / 3.0)),
     )
 
 
@@ -949,6 +952,72 @@ def loss_function(
     return per_event_loss.mean()
     
 
+
+def build_portable_inference_context(
+    runtime: CNPRuntimeConfig,
+    *,
+    context_size: int = 4096,
+    seed_offset: int = 104729,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build the fixed context that is embedded into the trained CNP checkpoint.
+
+    This is intentionally independent of the training loop and training mode.
+    A fresh H5EventPool is created after training with its own deterministic RNG,
+    so the exported inference context does not depend on whether training used
+    minibatches, full passes, or a particular sequence of sampled batches.
+
+    Returns
+    -------
+    context_x:
+        float32 CPU tensor with shape (N_context, x_dim)
+    context_y_idx:
+        int64 CPU tensor with shape (N_context,), containing zero-based shell labels
+    """
+    context_size = int(context_size)
+    if context_size < 2:
+        raise ValueError("Portable CNP inference context must contain at least 2 events.")
+
+    context_pool = H5EventPool(
+        runtime.train_dir,
+        theta_headers=runtime.theta_headers,
+        phi_headers=runtime.phi_headers,
+        target_headers=runtime.target_headers,
+        n_shells=runtime.n_shells,
+        seed=int(runtime.seed) + int(seed_offset),
+        cache_files=False,
+    )
+
+    files_per_batch = max(
+        1,
+        min(int(runtime.files_per_batch_train), len(context_pool.files)),
+    )
+
+    batch = context_pool.sample_batch(
+        batch_size=context_size,
+        files_per_batch=files_per_batch,
+    )
+
+    context_x = batch.x.detach().cpu().to(dtype=torch.float32).contiguous()
+    context_y_idx = batch.y.detach().cpu().to(dtype=torch.long).contiguous()
+
+    if context_x.ndim != 2:
+        raise ValueError(
+            f"Portable inference context_x must be 2D, got {tuple(context_x.shape)}"
+        )
+    if context_y_idx.ndim != 1:
+        raise ValueError(
+            f"Portable inference context_y_idx must be 1D, got {tuple(context_y_idx.shape)}"
+        )
+    if len(context_x) != len(context_y_idx):
+        raise ValueError(
+            "Portable inference context x/y length mismatch: "
+            f"{len(context_x)} vs {len(context_y_idx)}"
+        )
+
+    return context_x, context_y_idx
+
+
 def train_cnp(
     runtime: CNPRuntimeConfig,
     steps_per_epoch: Optional[int] = None,
@@ -960,6 +1029,7 @@ def train_cnp(
     monitor_every: Optional[int] = None,
     show_monitor_plots: bool = False,
     device: Optional[str] = None,
+    inference_context_size: int = 4096,
 ) -> TrainResult:
     runtime.out_dir.mkdir(parents=True, exist_ok=True)
     set_seed(runtime.seed)
@@ -1178,9 +1248,21 @@ def train_cnp(
             global_step += 1
             epoch_steps += 1
 
+    # Build a fixed, portable inference context AFTER training using a fresh
+    # deterministic data sampler.  This is not another training step.
+    inference_context_x, inference_context_y_idx = build_portable_inference_context(
+        runtime,
+        context_size=inference_context_size,
+    )
+    print(
+        "[context] embedding fixed inference context in CNP checkpoint: "
+        f"{len(inference_context_x):,} events"
+    )
+
     # Save model and artifacts.
     model_path = runtime.out_dir / f"cnp_{runtime.version}_model_{runtime.epochs}epochs.pth"
     torch.save({
+            "checkpoint_format": CNP_CHECKPOINT_FORMAT,
             "state_dict": model.state_dict(),
             "x_dim": x_dim,
             "y_dim": y_dim,
@@ -1199,8 +1281,33 @@ def train_cnp(
             "context_mode": runtime.context_mode,
             "version": runtime.version,
             "loss": "weighted_conditional_cross_entropy",
+
+            # Portable inference state.
+            # These tensors are CPU tensors and travel with the .pth file.
+            "inference_context_x": inference_context_x,
+            "inference_context_y_idx": inference_context_y_idx,
+            "inference_context_size": int(len(inference_context_x)),
+            "inference_context_seed": int(runtime.seed) + 104729,
+            "inference_context_policy": "independent_post_training_random_sample",
+
+            # Everything required to convert raw validation events into the same
+            # representation used by this trained model.
+            "scale_power": float(runtime.scale_power),
+            "preprocessing": {
+                "theta_headers": list(runtime.theta_headers),
+                "phi_headers": list(runtime.phi_headers),
+                "target_headers": list(runtime.target_headers),
+                "n_shells": int(runtime.n_shells),
+                "scale_power": float(runtime.scale_power),
+                "shell_definition": "centered_cylindrical_equal_volume_scaling",
+                "source_radial_feature": "s_r=sqrt(sx^2+sy^2)",
+                "source_axial_feature": "s_z_from_center=abs(sz-z_center)",
+                "truth_radial_feature": "r=sqrt(x^2+y^2)",
+                "truth_axial_feature": "z_from_center=abs(z-z_center)",
+            },
         }, model_path,
     )
+    print(f"[saved] CNP checkpoint: {model_path}")
 
     hist_df = pd.DataFrame(history_rows)
     history_csv = runtime.out_dir / f"cnp_{runtime.version}_history_{runtime.epochs}epochs.csv"
@@ -1244,10 +1351,22 @@ def train_cnp(
     )
 
 
-def load_model_checkpoint(model_path: str | Path, device: Optional[str] = None) -> DeterministicCNP:
+def load_cnp_checkpoint(
+    model_path: str | Path,
+    device: Optional[str] = None,
+) -> tuple[DeterministicCNP, dict]:
+    """Load a saved CNP model and return both the model and checkpoint metadata.
+
+    Older checkpoints that predate ``checkpoint_format`` remain supported.
+    """
     model_path = Path(model_path)
     dev = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
     ckpt = torch.load(model_path, map_location=dev)
+
+    required = {"state_dict", "x_dim", "y_dim", "repr_dim", "hidden", "dropout"}
+    missing = sorted(required - set(ckpt))
+    if missing:
+        raise ValueError(f"CNP checkpoint {model_path} is missing fields: {missing}")
 
     model = DeterministicCNP(
         x_dim=int(ckpt["x_dim"]),
@@ -1261,7 +1380,102 @@ def load_model_checkpoint(model_path: str | Path, device: Optional[str] = None) 
     model.load_state_dict(ckpt["state_dict"])
     model.to(dev)
     model.eval()
+    return model, ckpt
+
+
+def load_model_checkpoint(model_path: str | Path, device: Optional[str] = None) -> DeterministicCNP:
+    """Backward-compatible model-only CNP checkpoint loader."""
+    model, _metadata = load_cnp_checkpoint(model_path, device=device)
     return model
+
+
+def load_cnp_inference_checkpoint(
+    model_path: str | Path,
+    device: Optional[str] = None,
+) -> tuple[DeterministicCNP, torch.Tensor, torch.Tensor, dict]:
+    """
+    Load a self-contained CNP checkpoint for prediction.
+
+    Returns
+    -------
+    model:
+        Trained CNP in eval mode.
+    context_x:
+        Fixed saved context on the model device.
+    context_y:
+        One-hot saved context labels on the model device.
+    metadata:
+        Full checkpoint dictionary.
+
+    Notes
+    -----
+    Checkpoints created before the portable-context format do not contain the
+    conditioning set required by a Conditional Neural Process.  Those older
+    files cannot be fully portable and must be re-saved/retrained with the new
+    pipeline before this loader can be used.
+    """
+    model, ckpt = load_cnp_checkpoint(model_path, device=device)
+    dev = next(model.parameters()).device
+
+    required = {
+        "inference_context_x",
+        "inference_context_y_idx",
+        "theta_headers",
+        "phi_headers",
+        "target_headers",
+        "n_shells",
+        "scale_power",
+    }
+    missing = sorted(required - set(ckpt))
+    if missing:
+        raise ValueError(
+            f"CNP checkpoint {model_path} is not self-contained for inference. "
+            f"Missing fields: {missing}. Re-save/retrain it with the portable-context "
+            "CNP pipeline."
+        )
+
+    context_x = torch.as_tensor(
+        ckpt["inference_context_x"],
+        dtype=torch.float32,
+        device=dev,
+    )
+    context_y_idx = torch.as_tensor(
+        ckpt["inference_context_y_idx"],
+        dtype=torch.long,
+        device=dev,
+    ).reshape(-1)
+
+    if context_x.ndim != 2:
+        raise ValueError(
+            f"Saved CNP context_x must be 2D, got {tuple(context_x.shape)}"
+        )
+    if context_x.shape[1] != int(ckpt["x_dim"]):
+        raise ValueError(
+            "Saved CNP context x dimension does not match checkpoint x_dim: "
+            f"{context_x.shape[1]} vs {ckpt['x_dim']}"
+        )
+    if len(context_x) != len(context_y_idx):
+        raise ValueError(
+            "Saved CNP context x/y length mismatch: "
+            f"{len(context_x)} vs {len(context_y_idx)}"
+        )
+
+    n_shells = int(ckpt["n_shells"])
+    if len(context_y_idx):
+        y_min = int(context_y_idx.min().item())
+        y_max = int(context_y_idx.max().item())
+        if y_min < 0 or y_max >= n_shells:
+            raise ValueError(
+                f"Saved CNP context shell labels must be in [0, {n_shells - 1}], "
+                f"got min={y_min}, max={y_max}"
+            )
+
+    context_y = F.one_hot(
+        context_y_idx,
+        num_classes=n_shells,
+    ).float()
+
+    return model, context_x, context_y, ckpt
 
 
 def predict_cnp(
@@ -1279,8 +1493,28 @@ def predict_cnp(
     if model_path is None:
         raise ValueError("Model Path must be provided when running prediction")
     model_path = Path(model_path)
-    model = load_model_checkpoint(model_path, device=device)
+    model, context_x, context_y, checkpoint = load_cnp_inference_checkpoint(
+        model_path,
+        device=device,
+    )
     dev = next(model.parameters()).device
+
+    # Ensure the runtime data contract agrees with the exported model.
+    if list(checkpoint["theta_headers"]) != list(runtime.theta_headers):
+        raise ValueError(
+            f"Runtime theta_headers {runtime.theta_headers} do not match saved model "
+            f"{checkpoint['theta_headers']}"
+        )
+    if list(checkpoint["phi_headers"]) != list(runtime.phi_headers):
+        raise ValueError(
+            f"Runtime phi_headers {runtime.phi_headers} do not match saved model "
+            f"{checkpoint['phi_headers']}"
+        )
+    if int(checkpoint["n_shells"]) != int(runtime.n_shells):
+        raise ValueError(
+            f"Runtime n_shells={runtime.n_shells} does not match saved model "
+            f"n_shells={checkpoint['n_shells']}"
+        )
 
     if output_epochs is None:
         output_epochs = runtime.epochs
@@ -1360,15 +1594,8 @@ def predict_cnp(
                     pbar.update(1)
                     continue
 
-                # Build context from sampled events in this H5 block.
-                rng = np.random.default_rng(runtime.seed + i + n)
-                n_context = max(2, int(runtime.context_ratio * n))
-                n_context = min(n_context, n - 1)
-                c_idx = rng.choice(n, size=n_context, replace=False)
-
-                context_x = torch.from_numpy(x_np[c_idx]).to(dev)
-                context_y_idx = torch.from_numpy(target_shell_np[c_idx]).long().to(dev)
-                context_y = F.one_hot(context_y_idx, num_classes=n_shells).float()
+                # Use the fixed context embedded in the checkpoint.
+                # Validation/prediction truth from this file is never used for conditioning.
 
                 fidelities = required_fidelity(
                     meta,
@@ -1454,7 +1681,7 @@ def predict_cnp(
                     if "agg_chunk" in locals():
                         del agg_chunk
 
-                del context_x, context_y, x_np, target_shell_np
+                del x_np, target_shell_np
 
                 pbar.update(1)
                 pbar.set_postfix(

@@ -21,12 +21,12 @@ simulation_settings:
   scale_power: 0.3333333333333333
 path_settings:
   version: xlzd_shell_v1_minibatch
-  path_to_files_train: ../outputs/datasets/training/lf
+  path_to_files_train: ../outputs/train/datasets/training/lf
   path_to_files_predict:
-  - ../outputs/datasets/validation/hf
+  - ../outputs/train/datasets/validation/hf
   iteration:
   - 0
   fidelity:
   - 1
-  path_out_cnp: ../outputs/cnp
-  path_out_mfgp: ../outputs/mfgp
+  path_out_cnp: ../outputs/train/cnp
+  path_out_mfgp: ../outputs/train/mfgp

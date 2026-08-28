@@ -1,30 +1,26 @@
 {
   "file_load": {
-    "input_dir": "data",
+    "input_dir": "data/train_data",
     "max_rows_per_file": null
   },
   "split": {
-    "lf_pool_fraction": 0.2,
-    "hf_pool_fraction": 0.4,
+    "validation_fraction": 0.4,
     "random_seed": 42,
     "stratify_by_component": false
   },
   "sampling": {
-    "hf_block_size": 100000,
-    "lf_block_size": 20000,
+    "hf_block_size": 10000,
+    "lf_block_size": 2000,
     "validation_block_size": null,
     "progress": true
   },
   "shell": {
-    "R_max": null,
-    "Z_max": null,
     "n_shells": 100,
     "min_candidate_events": 1,
-    "z_center": null,
     "scale_power": 0.3333333333333333
   },
   "output": {
-    "output_dir": "outputs/cnp_mfgp",
+    "output_dir": "cnp_mfgp/outputs/train/datasets",
     "output_format": "csv"
   }
 }

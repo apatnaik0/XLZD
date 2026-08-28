@@ -1,6 +1,6 @@
 {
   "file_load": {
-    "input_dir": "data",
+    "input_dir": "data/train_data",
     "max_rows_per_file": null
   },
   "split": {
@@ -20,7 +20,7 @@
     "scale_power": 0.333333333333
   },
   "output": {
-    "output_dir": "cnp_mfgp/outputs/datasets",
+    "output_dir": "cnp_mfgp/outputs/train/datasets",
     "output_format": "csv"
   }
 }
