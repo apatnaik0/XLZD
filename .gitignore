@@ -23,6 +23,8 @@ cnp_mfgp/outputs/**
 !cnp_mfgp/outputs/**/
 !cnp_mfgp/outputs/**/.gitkeep
 
+new_model/outputs/**
+
 # Depth penetration HTML artifacts
 archive/depth_penetration_experiments/artifacts/**
 !archive/depth_penetration_experiments/artifacts/.gitkeep
