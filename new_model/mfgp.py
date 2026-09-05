@@ -126,11 +126,19 @@ def load_config(path: str | Path) -> dict:
 # -----------------------------------------------------------------------------
 class CleanAutoregressiveMFGP:
     """Two-level autoregressive MF-GP using sklearn Gaussian processes."""
-    def __init__(self, random_state: int = 42, alpha_lf: float = 1e-8, alpha_hf: float = 1e-8) -> None:
+    def __init__(self, 
+                 random_state: int = 42,
+                 alpha_lf: float = 1e-8, 
+                 alpha_hf: float = 1e-8,
+                 kernel_noise: float = 1e-5, 
+                 kernel_noise_lim: tuple[float] = (1e-10, 1e1)
+                ) -> None:
         self.random_state = int(random_state)
         self.alpha_lf = float(alpha_lf)
         self.alpha_hf = float(alpha_hf)
-
+        self.kernel_noise = float(kernel_noise)
+        self.kernel_noise_lim = tuple(kernel_noise_lim)
+        
         self.x_scaler: Optional[StandardScaler] = None
         self.y_lf_scaler: Optional[StandardScaler] = None
         self.y_d_scaler: Optional[StandardScaler] = None
@@ -142,7 +150,7 @@ class CleanAutoregressiveMFGP:
         self.x_dim: Optional[int] = None
 
     def _kernel(self, input_dim: int):
-        return ConstantKernel(1.0, (1e-4, 1e4)) * Matern(length_scale=np.ones(input_dim), length_scale_bounds=(1e-3, 1e3), nu=1.5) + WhiteKernel(noise_level=1e-5, noise_level_bounds=(1e-10, 1e1))
+        return ConstantKernel(1.0, (1e-4, 1e4)) * Matern(length_scale=np.ones(input_dim), length_scale_bounds=(1e-3, 1e3), nu=1.5) + WhiteKernel(noise_level=self.kernel_noise, noise_level_bounds=self.kernel_noise_lim)
 
     def fit(self, x_lf: np.ndarray, y_lf: np.ndarray, x_hf: np.ndarray, y_hf: np.ndarray, verbose: bool = False) -> CleanAutoregressiveMFGP:
         x_lf = np.asarray(x_lf, dtype=float)
@@ -219,13 +227,10 @@ class CleanAutoregressiveMFGP:
             raise RuntimeError("Model has not been fitted")
 
         x = np.asarray(x, dtype=float)
-
         if x.ndim == 1:
             x = x.reshape(1, -1)
-
         if x.ndim != 2:
             raise ValueError(f"x must be 2D, got shape {x.shape}")
-
         if self.x_dim is not None and x.shape[1] != self.x_dim:
             raise ValueError(f"Expected {self.x_dim} input dimensions, got {x.shape[1]}")
 
@@ -337,7 +342,7 @@ def regression_metrics(
 # -----------------------------------------------------------------------------
 # Checkpoints
 # -----------------------------------------------------------------------------
-def save_mfgp_checkpoint(model: CleanAutoregressiveMFGP, model_path: str | Path, *, version: str, input_names: Sequence[str], random_state: int, alpha_lf: float, alpha_hf: float) -> Path:
+def save_mfgp_checkpoint(model: CleanAutoregressiveMFGP, model_path: str | Path, *, version: str, input_names: Sequence[str], random_state: int, alpha_lf: float, alpha_hf: float, kernel_noise: float, kernel_noise_lim: tuple[float]) -> Path:
     """Save a fitted linear-space MF-GP and all metadata required for inference."""
     model_path = Path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,6 +358,8 @@ def save_mfgp_checkpoint(model: CleanAutoregressiveMFGP, model_path: str | Path,
         "random_state": int(random_state),
         "alpha_lf": float(alpha_lf),
         "alpha_hf": float(alpha_hf),
+        "kernel_noise": float(kernel_noise),
+        "kernel_noise_lim": tuple(kernel_noise_lim),
     }
 
     joblib.dump(bundle, model_path)
@@ -478,6 +485,8 @@ def run_mfgp_training(
 
     alpha_lf_floor = float(model_cfg.get("alpha_lf_floor", 1e-10))
     alpha_hf = float(model_cfg.get("alpha_hf", 1e-10))
+    kernel_noise = float(model_cfg.get("kernel_noise", 1e-5))
+    kernel_noise_lim = tuple(model_cfg.get("kernel_noise_lim", (1e-10, 1e1)))
 
     if training_data.y_lf_err is None:
         alpha_lf = alpha_lf_floor
@@ -485,7 +494,13 @@ def run_mfgp_training(
         lf_sigma = np.maximum(np.asarray(training_data.y_lf_err, dtype=float), 1e-12)
         alpha_lf = max(float(np.mean(np.square(lf_sigma))), alpha_lf_floor)
 
-    model = CleanAutoregressiveMFGP(random_state=random_state, alpha_lf=alpha_lf, alpha_hf=alpha_hf)
+    model = CleanAutoregressiveMFGP(
+        random_state=random_state, 
+        alpha_lf=alpha_lf,
+        alpha_hf=alpha_hf,
+        kernel_noise=kernel_noise,
+        kernel_noise_lim=kernel_noise_lim,
+    )
 
     if verbose:
         print(f"=== MF-GP training: {version} ===")
@@ -504,6 +519,8 @@ def run_mfgp_training(
         random_state=random_state,
         alpha_lf=alpha_lf,
         alpha_hf=alpha_hf,
+        kernel_noise=kernel_noise,
+        kernel_noise_lim=kernel_noise_lim,
     )
 
     chunk_size = int(prediction_cfg.get("chunk_size", 20000))
@@ -546,6 +563,8 @@ def run_mfgp_training(
         "rho": float(model.rho),
         "alpha_lf": float(alpha_lf),
         "alpha_hf": float(alpha_hf),
+        "kernel_noise": float(kernel_noise),
+        "kernel_noise_lim": tuple(kernel_noise_lim),
         "lf_kernel": str(model.gp_lf.kernel_) if model.gp_lf is not None else None,
         "hf_discrepancy_kernel": str(model.gp_d.kernel_) if model.gp_d is not None else None,
     }
