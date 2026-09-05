@@ -1,50 +1,31 @@
-# Raw data
-data/**
-!data/.gitkeep
-!data/**/
-!data/**/.gitkeep
-old_data/**
-
-# Generated outputs
-archive/outputs/**
-!archive/outputs/.gitkeep
-!archive/outputs/**/
-!archive/outputs/**/.gitkeep
-
-archive/outputs_smoke/**
-!archive/outputs_smoke/.gitkeep
-!archive/outputs_smoke/**/
-!archive/outputs_smoke/**/.gitkeep
-
-archive/xlzd_data
-
-cnp_mfgp/outputs/**
-!cnp_mfgp/outputs/.gitkeep
-!cnp_mfgp/outputs/**/
-!cnp_mfgp/outputs/**/.gitkeep
-
-new_model/outputs/**
-
-# Depth penetration HTML artifacts
-archive/depth_penetration_experiments/artifacts/**
-!archive/depth_penetration_experiments/artifacts/.gitkeep
-archive/lf_augmentations/artifacts/**
-!archive/lf_augmentations/artifacts/.gitkeep
-
-# Python cache / build artifacts
+.vscode/
+n cache
 __pycache__/
 *.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 
-# Virtual environments
-.venv/
-venv/
-env/
+# Jupyter
+.ipynb_checkpoints/
 
-# OS / editor files
+# Simulation / ML data
+data/**/
+outputs/**/
+
+# Generated data files
+*.h5
+*.root
+
+# Model checkpoints
+*.pth
+*.ckpt
+*.joblib
+
+# Logs / temporary files
+*.log
+*.tmp
+*.swp
+
+# OS/editor junk
 .DS_Store
-.idea/
+Thumbs.db
 .vscode/
+
