@@ -46,17 +46,14 @@ except:
 def find_repo_root(start: Path | None = None) -> Path:
     start = (start or Path.cwd()).resolve()
     for candidate in [start, *start.parents]:
-        if (candidate / "PROJECT_EXPERIMENT_GUIDE.md").exists() and (candidate / "README.md").exists():
+        if (candidate / "cnp.py").exists() and (candidate / "mfgp.py").exists():
             return candidate
     raise RuntimeError("Could not find the XLZD repo root from the current working directory.")
 
 
 REPO_ROOT = find_repo_root()
-SRC_ROOT = REPO_ROOT / "src"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
 
 from common.config import FileLoadConfig, DEFAULT_FILE_STEMS, SamplingConfig, OutputConfig, EVENT_ID_COLUMN
 from common.dataset import split_pool_into_blocks

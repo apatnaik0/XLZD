@@ -1,16 +1,16 @@
 [run]
 version = "shell_v1"
-output_dir = "./outputs/cnp"
+output_dir = "../outputs/cnp"
 seed = 42
 device = "auto"  # "auto", "cuda", or "cpu"
 
 [training]
 epochs = 15
-steps_per_epoch = 100
+steps_per_epoch = 1000
 batch_size = 1200
 # validation_batch_size = 300
 use_full_epochs = false  # false = randomly sampled batches, true = one full pass through data per epoch
-monitor_every = 100
+monitor_every = 1000
 
 [context]
 ratio = 0.3333333333333333
@@ -23,5 +23,5 @@ hidden_dim = 128
 dropout = 0.10
 
 [optimizer]
-learning_rate = 1.0e-4
+learning_rate = 1.0e-3
 weight_decay = 0.0

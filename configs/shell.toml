@@ -1,7 +1,7 @@
 [data]
 input_dir = "../data/train_data"
 manifest = "file_manifest.csv"
-output_dir = "./outputs/shell"
+output_dir = "../outputs/shell"
 output_format = "csv"
 # max_rows_per_file = 100000  # Optional. Leave this line out to read every event.
 

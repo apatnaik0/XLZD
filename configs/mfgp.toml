@@ -1,6 +1,6 @@
 [run]
 version = "mfgp_v1"
-output_dir = "./outputs/mfgp"
+output_dir = "../outputs/mfgp"
 random_state = 42
 verbose = true
 
@@ -15,7 +15,7 @@ require_axis_span = true
 [model]
 alpha_lf_floor = 1.0e-10
 alpha_hf = 1.0e-10
-kernel_noise = 1e-5
+kernel_noise = 1e-6
 kernel_noise_lim = [1e-10, 1e1]
 
 [prediction]
