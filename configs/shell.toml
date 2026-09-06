@@ -1,0 +1,32 @@
+[data]
+input_dir = "../data/train_data"
+manifest = "file_manifest.csv"
+output_dir = "../outputs/shell"
+output_format = "csv"
+# max_rows_per_file = 100000  # Optional. Leave this line out to read every event.
+
+[shell]
+n_shells = 100
+scale_power = 0.3333333333333333
+min_candidate_events = 1
+
+[split]
+validation_fraction = 0.40
+random_seed = 42
+
+[blocks]
+lf_block_size = 2000
+hf_block_size = 10000
+# validation_block_size = 100000  # Leave absent to use hf_block_size for validation.
+
+[provider]
+files_per_batch_train = 32
+files_per_batch_validation = 16
+cache_training_files = true
+
+[loss]
+sigma = 1.25
+hard_fraction = 0.50
+use_class_weights = false
+class_weight_beta = 0.50
+class_weight_max = 20.0
