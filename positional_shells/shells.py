@@ -1,26 +1,4 @@
-"""
-Shell specific data preparation and CNP data providers
-
-This file has all the XLZD shell-based data handling used with the generic CNP
-    Raw event files + file_manifest.csv -> labelled shell events
-    LF/HF training and HF validation splitting
-    Event-class HDF5 block writing
-    HDF5 sampling/batch providers used by CNP
-
-Shell Construction
-    Centered on the detector center
-    Outer shell boundaries follow
-        R_i = R_max * (i/n_shells) ^ scale_power
-        Z_i = Z_max * (i/n_shells) ^ scale_power
-    Shell i is the region inside outer boundary i and outside i-1
-
-Target shell = zero-indexed shell class label
-
-Dataset Splits
-    Fidelity = 0 is LF
-    Fidelity = 1 is HF
-    Validation_Fraction is fraction of HF to move to validation
-"""
+"""Shell-position data preparation and CNP/MF-GP notebook runners."""
 
 from __future__ import annotations
 
@@ -29,19 +7,20 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional, Sequence
-from functools import partial
 
+import h5py
 import numpy as np
 import pandas as pd
-import h5py
 from tqdm.auto import tqdm
 
 try:
     import tomllib
 except:
     import tomli as tomllib
+
 
 def find_repo_root(start: Path | None = None) -> Path:
     start = (start or Path.cwd()).resolve()
@@ -50,31 +29,28 @@ def find_repo_root(start: Path | None = None) -> Path:
             return candidate
     raise RuntimeError("Could not find the XLZD repo root from the current working directory.")
 
-
 REPO_ROOT = find_repo_root()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from common.config import FileLoadConfig, DEFAULT_FILE_STEMS, SamplingConfig, OutputConfig, EVENT_ID_COLUMN
+from common.config import DEFAULT_FILE_STEMS, EVENT_ID_COLUMN, FileLoadConfig, OutputConfig, SamplingConfig
 from common.dataset import split_pool_into_blocks
 from common.io_utils import load_event_file, save_dataframe
-from common.theta import add_centered_z_coordinate, Z_FROM_CENTER_COLUMN
-from common.pipeline_utils import log_stage, finish_stage
-
+from common.pipeline_utils import finish_stage, log_stage
+from common.theta import Z_FROM_CENTER_COLUMN, add_centered_z_coordinate
 import cnp
 import mfgp
 
-# -----------------------------------------------------------------------------
-# Names
-# -----------------------------------------------------------------------------
 TARGET_COLUMN = "target_shell"
 THETA_HEADERS = ["detector_R", "detector_Z"]
 PHI_HEADERS = ["s_r", "s_z_from_center"]
 MANIFEST_NAME = "file_manifest.csv"
 
+
 # -----------------------------------------------------------------------------
-# Dataclasses
+# Utilities
 # -----------------------------------------------------------------------------
+
 @dataclass
 class HFValidationSplitConfig:
     """Config for holding out a fraction of HF events for validation"""
@@ -84,6 +60,26 @@ class HFValidationSplitConfig:
     def validate(self) -> None:
         if not 0.0 < self.validation_fraction < 1.0:
             raise ValueError(f"Validation Fraction must be between 0 and 1, got {self.validation_fraction}")
+
+@dataclass(slots=True)
+class ShellConfig:
+    """Top level config that houses all data about shell distributions"""
+    R_max: float | None = None
+    Z_max: float | None = None
+    n_shells: int = 100
+    min_candidate_events: int = 25
+    z_center: float | None = None
+    scale_power: float = 1.0 / 3.0
+
+    def validate(self) -> None:
+        if self.R_max is not None and self.R_max <= 0:
+            raise ValueError("R_max must be positive")
+        if self.Z_max is not None and self.Z_max <= 0:
+            raise ValueError("Z_max must be positive")
+        if self.n_shells <= 0:
+            raise ValueError("n_shells must be positive.")
+        if self.min_candidate_events <= 0:
+            raise ValueError("min_candidate_events must be positive.")
 
 @dataclass(frozen=True)
 class PreparationConfig:
@@ -110,26 +106,6 @@ class PreparationResult:
     manifest_path: Path
 
 @dataclass(slots=True)
-class ShellConfig:
-    """Top level config that houses all data about shell distributions"""
-    R_max: float | None = None
-    Z_max: float | None = None
-    n_shells: int = 100
-    min_candidate_events: int = 25
-    z_center: float | None = None
-    scale_power: float = 1.0/3.0
-
-    def validate(self) -> None:
-        if self.R_max is not None and self.R_max <=0:
-            raise ValueError("R_max must be positive")
-        if self.Z_max is not None and self.Z_max <=0:
-            raise ValueError("Z_max must be positive")
-        if self.n_shells <= 0:
-            raise ValueError("n_shells must be positive.")
-        if self.min_candidate_events <= 0:
-            raise ValueError("min_candidate_events must be positive.")
-
-@dataclass(slots=True)
 class ShellEventBlock:
     features: np.ndarray
     truth_shell: np.ndarray
@@ -137,16 +113,6 @@ class ShellEventBlock:
     event_index: np.ndarray
     valid_events: pd.DataFrame
 
-@dataclass(frozen=True)
-class ShellPredictionResults:
-    """Outputs from running the CNP on a shell event pool"""
-    prediction_path: Path
-    n_events: int
-    n_groups: int
-    
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
 def _validate_fidelity_series(values: pd.Series, *, context: str) -> pd.Series:
     """Return integer fidelity values and reject anything other than 0 or 1"""
     numeric = pd.to_numeric(values, errors="coerce")
@@ -155,7 +121,7 @@ def _validate_fidelity_series(values: pd.Series, *, context: str) -> pd.Series:
         numeric.to_numpy(dtype=float),
         np.rint(numeric.to_numpy(dtype=float)),
     )
-    invalid_binary = numeric.notna() & ~numeric.isin({0,1})
+    invalid_binary = numeric.notna() & ~numeric.isin({0, 1})
     invalid = invalid_numeric | non_integer | invalid_binary
 
     if invalid.any():
@@ -175,10 +141,32 @@ def _as_h5_array(value: object) -> np.ndarray:
     return arr
 
 def block_range(blocks: Sequence[pd.DataFrame]) -> tuple[int, int]:
-    if not blocks: 
-        return 0,0
+    if not blocks:
+        return 0, 0
     sizes = [len(block) for block in blocks]
     return int(min(sizes)), int(max(sizes))
+
+def _prediction_meta_array(meta: dict[str, np.ndarray], key: str, n_events: int, *, file_path: Path) -> np.ndarray:
+    if key not in meta:
+        raise ValueError(f"{file_path.name}: missing required metadata field {key!r}")
+
+    values = np.asarray(meta[key]).reshape(-1)
+    if len(values) == 1 and n_events != 1:
+        values = np.repeat(values[0], n_events)
+    if len(values) != n_events:
+        raise ValueError(f"{file_path.name}: metadata {key!r} has {len(values)} values for {n_events} events")
+
+    if values.dtype.kind == "S":
+        values = np.char.decode(values, "utf-8")
+    elif values.dtype.kind == "O":
+        values = np.asarray([
+            value.decode("utf-8")
+            if isinstance(value, (bytes, np.bytes_))
+            else value
+            for value in values
+        ])
+
+    return values
 
 def print_summary(
     *,
@@ -204,37 +192,6 @@ def print_summary(
         size_range = info["size_range"]
         print(f"{label}: blocks={info['block_count']}, block_size_range={size_range[0]}-{size_range[1]}, unused_leftover_rows={info['leftover_rows']}")
 
-def _prediction_meta_array(
-    meta: dict[str, np.ndarray],
-    key: str,
-    n_events: int,
-    *,
-    file_path: Path,
-) -> np.ndarray:
-    if key not in meta:
-        raise ValueError(f"{file_path.name}: missing required metadata field {key!r}")
-        
-    values = np.asarray(meta[key]).reshape(-1)
-    if len(values) == 1 and n_events != 1:
-        values = np.repeat(values[0], n_events)
-    if len(values) != n_events:
-        raise ValueError(f"{file_path.name}: metadata {key!r} has {len(values)} values for {n_events} events")
-
-    if values.dtype.kind == "S":
-        values = np.char.decode(values, "utf-8")
-    elif values.dtype.kind == "O":
-        values = np.asarray([
-            value.decode("utf-8")
-            if isinstance(value, (bytes, np.bytes_))
-            else value
-            for value in values
-        ])
-
-    return values
-
-# -----------------------------------------------------------------------------
-# Configs
-# -----------------------------------------------------------------------------
 def load_config(path: Path) -> dict:
     """Loads either a JSON or a TOML config"""
     if not path.exists():
@@ -245,17 +202,17 @@ def load_config(path: Path) -> dict:
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
     elif suffix == ".toml":
-        with path.open('rb') as f:
+        with path.open("rb") as f:
             return tomllib.load(f)
     raise ValueError(f"Unsupported config format {suffix!r}. Expected json or toml")
-        
+
 def load_file_manifest(input_dir: Path, manifest_name: str = MANIFEST_NAME) -> pd.DataFrame:
     """
     Loads data manifest of input files
 
     Structure:
         filename   Name of file, extension included
-        R          Maximum radius of the detector 
+        R          Maximum radius of the detector
         Z          Maximum Z (half-height) of the detector
         z_center   Z-value of the center of the detector (usually just equal to the half-height)
         fidelity   0 for LF, 1 for HF
@@ -267,13 +224,11 @@ def load_file_manifest(input_dir: Path, manifest_name: str = MANIFEST_NAME) -> p
                            na_values=["", "None", "none", "NULL", "null", "NaN", "nan"],
                            keep_default_na=True)
 
-    # Check if all columns are there
     required = {"filename", "R", "Z", "z_center", "fidelity"}
     missing = required - set(manifest.columns)
     if missing:
         raise ValueError(f"Manifest is missing required columns {sorted(missing)}")
 
-    # Clean it up
     manifest = manifest.copy()
     manifest["filename"] = manifest["filename"].astype(str).str.strip()
     manifest["R"] = pd.to_numeric(manifest["R"], errors="coerce")
@@ -309,7 +264,7 @@ def build_config(config_path: str | Path) -> PreparationConfig:
     split = raw.get("split", {})
     blocks = raw.get("blocks", {})
     shell = raw.get("shell", {})
-    
+
     if "validation_fraction" not in split:
         raise ValueError("Config must define validation_fraction under [split]")
     if "input_dir" not in data:
@@ -321,34 +276,36 @@ def build_config(config_path: str | Path) -> PreparationConfig:
         file_load=FileLoadConfig(
             input_dir=Path(data["input_dir"]),
             file_stems=data.get("file_stems", list(DEFAULT_FILE_STEMS)),
-            max_rows_per_file=data.get("max_rows_per_file")),
+            max_rows_per_file=data.get("max_rows_per_file"),
+        ),
         split=HFValidationSplitConfig(
             validation_fraction=float(split["validation_fraction"]),
-            random_seed=int(split.get("random_seed", 42))),
+            random_seed=int(split.get("random_seed", 42)),
+        ),
         sampling=SamplingConfig(
             hf_block_size=int(blocks.get("hf_block_size", 100000)),
             lf_block_size=int(blocks.get("lf_block_size", 20000)),
             validation_block_size=None if blocks.get("validation_block_size") is None else int(blocks["validation_block_size"]),
-            progress=bool(blocks.get("progress", True))),
+            progress=bool(blocks.get("progress", True)),
+        ),
         shell=ShellConfig(
             R_max=None,
             Z_max=None,
             n_shells=int(shell.get("n_shells", 100)),
             min_candidate_events=int(shell.get("min_candidate_events", 25)),
             z_center=None,
-            scale_power=float(shell.get("scale_power", 1.0 / 3.0))),
+            scale_power=float(shell.get("scale_power", 1.0 / 3.0)),
+        ),
         output=OutputConfig(
             output_dir=Path(data["output_dir"]),
             output_format=str(data.get("output_format", "csv")),
-        ))
+        ),
+    )
 
     config.validate()
     return config
 
-def build_shell_config_for_manifest_row(
-    row: pd.Series,
-    base_shell_cfg: ShellConfig,
-) -> ShellConfig:
+def build_shell_config_for_manifest_row(row: pd.Series, base_shell_cfg: ShellConfig) -> ShellConfig:
     return ShellConfig(
         R_max=float(row["R"]),
         Z_max=float(row["Z"]),
@@ -359,8 +316,168 @@ def build_shell_config_for_manifest_row(
     )
 
 # -----------------------------------------------------------------------------
-# Data Management
+# Data conversion
 # -----------------------------------------------------------------------------
+
+def shell_boundaries(shell_cfg: ShellConfig) -> pd.DataFrame:
+    idx = np.arange(0, shell_cfg.n_shells + 1, dtype=float)
+    frac = idx / float(shell_cfg.n_shells)
+    scale = frac ** shell_cfg.scale_power
+    r = shell_cfg.R_max * scale
+    z = shell_cfg.Z_max * scale
+    return pd.DataFrame(
+        {
+            "shell_level": idx.astype(int),
+            "R_boundary": r.astype(float),
+            "Z_boundary": z.astype(float),
+        }
+    )
+
+def inside_shell(df: pd.DataFrame, *, R_inner: float, Z_inner: float, R_outer: float, Z_outer: float) -> np.ndarray:
+    required = {"r", Z_FROM_CENTER_COLUMN}
+    if not required.issubset(df.columns):
+        raise ValueError(f"Block dataframe must contain columns {required}.")
+
+    r = df["r"].to_numpy(dtype=float)
+    z = df[Z_FROM_CENTER_COLUMN].to_numpy(dtype=float)
+
+    inside_outer = (r <= R_outer) & (z <= Z_outer)
+    inside_inner = (r <= R_inner) & (z <= Z_inner)
+    return inside_outer & ~inside_inner
+
+def build_shell_table(df_for_support: pd.DataFrame, shell_cfg: ShellConfig) -> pd.DataFrame:
+    boundaries = shell_boundaries(shell_cfg)
+    support_rows: list[dict[str, float | int]] = []
+
+    for i in range(1, shell_cfg.n_shells + 1):
+        prev = boundaries.iloc[i - 1]
+        curr = boundaries.iloc[i]
+        mask = inside_shell(
+            df_for_support,
+            R_inner=float(prev["R_boundary"]),
+            Z_inner=float(prev["Z_boundary"]),
+            R_outer=float(curr["R_boundary"]),
+            Z_outer=float(curr["Z_boundary"]),
+        )
+        outer_volume = 2.0*np.pi*float(curr["Z_boundary"])*float(curr["R_boundary"])**2
+        inner_volume = 2.0*np.pi*float(prev["Z_boundary"])*float(prev["R_boundary"])**2
+        shell_volume = outer_volume - inner_volume
+        support_rows.append(
+            {
+                "shell_index": int(i),
+                "class_index": int(i-1),
+                "R_inner": float(prev["R_boundary"]),
+                "Z_inner": float(prev["Z_boundary"]),
+                "R_shell": float(curr["R_boundary"]),
+                "Z_shell": float(curr["Z_boundary"]),
+                "candidate_events": int(mask.sum()),
+                "shell_volume": float(shell_volume),
+            }
+        )
+
+    out = pd.DataFrame(support_rows)
+    low_support = out[out["candidate_events"] < shell_cfg.min_candidate_events]
+    if not low_support.empty:
+        print("[warn] Some shell classes have low support, but they are kept for categorical CE because class IDs must remain fixed")
+
+    return out.sort_values(["shell_index"]).reset_index(drop=True)
+
+def positive_shells_for_block(block_df: pd.DataFrame, shell_table_df: pd.DataFrame) -> pd.Series:
+    """
+    Return one positive shell index per event
+
+    The returned shell is one-indexed
+    Events outside the detector bounds are labelled NaN
+    """
+    positive_shell = pd.Series(np.nan, index=block_df.index, dtype="float")
+
+    for row in shell_table_df.itertuples(index=False):
+        mask = inside_shell(
+            block_df,
+            R_inner=float(row.R_inner),
+            Z_inner=float(row.Z_inner),
+            R_outer=float(row.R_shell),
+            Z_outer=float(row.Z_shell),
+        )
+        positive_shell.loc[mask] = int(row.shell_index)
+
+    return positive_shell
+
+def build_shell_event_block(
+    *,
+    block_df: pd.DataFrame,
+    shell_table_df: pd.DataFrame,
+    feature_columns: Sequence[str],
+    keep_event_data: bool = True,
+) -> ShellEventBlock:
+    missing_features = [col for col in feature_columns if col not in block_df.columns]
+    if missing_features:
+        raise ValueError(f"Block is missing required feature columns: {missing_features}")
+
+    positive_shell_one_based = positive_shells_for_block(
+        block_df=block_df, shell_table_df=shell_table_df,
+    )
+
+    valid_mask = positive_shell_one_based.notna()
+    if not valid_mask.any():
+        raise RuntimeError("This block has no events with a valid shell")
+    valid_events = block_df.loc[valid_mask].copy()
+
+    human_shell = positive_shell_one_based.loc[valid_mask].astype(np.int32).to_numpy()
+    truth_shell = human_shell.astype(np.int64) - 1
+    features = valid_events[list(feature_columns)].to_numpy(dtype=np.float32)
+    event_index = valid_events.index.to_numpy(dtype=np.int64)
+
+    if keep_event_data:
+        valid_events["event_index"] = event_index
+        valid_events["human_shell_index"] = human_shell
+        valid_events["truth_shell"] = truth_shell
+
+    return ShellEventBlock(
+        features=features,
+        truth_shell=truth_shell.astype(np.int64),
+        human_shell=human_shell.astype(np.int32),
+        event_index=event_index.astype(np.int64),
+        valid_events=valid_events
+    )
+
+def assign_shell_labels_for_file(
+    *,
+    events: pd.DataFrame,
+    shell_table_df: pd.DataFrame,
+    phi_headers: Sequence[str],
+) -> pd.DataFrame:
+    work = events.copy()
+    if EVENT_ID_COLUMN in work.columns:
+        work["original_event_id"] = work[EVENT_ID_COLUMN].to_numpy()
+    else:
+        work["original_event_id"] = np.arange(len(work), dtype=np.int64)
+
+    work[EVENT_ID_COLUMN] = np.arange(len(work), dtype=np.int64)
+    shell_block = build_shell_event_block(
+        block_df=work,
+        shell_table_df=shell_table_df,
+        feature_columns=phi_headers,
+        keep_event_data=False,
+    )
+
+    if len(shell_block.truth_shell) == 0:
+        return work.iloc[:0].copy()
+    valid_row_positions = np.asarray(shell_block.event_index, dtype=np.int64)
+
+    labeled = work.iloc[valid_row_positions].copy()
+    labeled[TARGET_COLUMN] = np.asarray(
+        shell_block.truth_shell,
+        dtype=np.int64,
+    )
+
+    labeled["shell_index"] = np.asarray(
+        shell_block.human_shell,
+        dtype=np.int64,
+    )
+
+    return labeled.reset_index(drop=True)
+
 def split_hf_training_validation(
     events: pd.DataFrame,
     *,
@@ -377,7 +494,6 @@ def split_hf_training_validation(
     if not 0.0 < float(validation_fraction) < 1.0:
         raise ValueError(f"Validation fraction must be between 0 and 1")
 
-    # Separate out HF
     lf_training = events[events["fidelity"] == 0].copy()
     hf_events = events[events["fidelity"] == 1].copy().reset_index(drop=True)
     if hf_events.empty:
@@ -389,7 +505,6 @@ def split_hf_training_validation(
         raise ValueError(f"At least two HF points required")
     n_validation = min(max(1, n_validation), n_hf - 1)
 
-    # Create random split
     rng = np.random.default_rng(int(random_seed))
     order = rng.permutation(n_hf)
     validation_idx = order[:n_validation]
@@ -399,7 +514,6 @@ def split_hf_training_validation(
     hf_validation = hf_events.iloc[validation_idx].copy().reset_index(drop=True)
     lf_training = lf_training.reset_index(drop=True)
 
-    # Printout
     print(f"[split] LF training (fidelity=0): {len(lf_training):,}")
     print(f"[split] HF training (fidelity=1): {len(hf_training):,}")
     print(f"[split] HF validation (fidelity=1): {len(hf_validation):,} ({validation_fraction:.2%} requested)")
@@ -429,7 +543,6 @@ def write_h5_class_block(
     phi = np.asarray(phi, dtype=np.float32)
     target_shell = np.asarray(target_shell, dtype=np.int64).reshape(-1)
 
-    # Buncha checks
     if theta.ndim != 2:
         raise ValueError(f"theta must have shape (N, theta_dim), got {theta.shape}")
     if phi.ndim != 2:
@@ -443,8 +556,7 @@ def write_h5_class_block(
     if phi.shape[1] != len(phi_headers):
         raise ValueError(f"phi dim/header mismatch: phi.shape={phi.shape}, phi_headers={list(phi_headers)}")
 
-    # Actually write the h5
-    with h5py.File(output_path, 'w') as f:
+    with h5py.File(output_path, "w") as f:
         f.create_dataset("theta", data=theta, compression="gzip", compression_opts=4)
         f.create_dataset("phi", data=phi, compression="gzip", compression_opts=4)
         f.create_dataset("target_shell", data=target_shell, compression="gzip", compression_opts=4)
@@ -455,7 +567,7 @@ def write_h5_class_block(
         meta_group = f.create_group("meta")
         for key, value in meta.items():
             meta_group.create_dataset(key, data=_as_h5_array(value), compression="gzip", compression_opts=4)
-    
+
 def write_h5_all_class_blocks(
     *,
     blocks: Sequence[pd.DataFrame],
@@ -547,124 +659,8 @@ def write_h5_all_class_blocks(
         )
 
     return pd.DataFrame.from_records(records)
-    
-            
-# -----------------------------------------------------------------------------
-# Shell Management
-# -----------------------------------------------------------------------------
-def assign_shell_labels_for_file(
-    *,
-    events: pd.DataFrame,
-    shell_table_df: pd.DataFrame,
-    phi_headers: Sequence[str],
-) -> pd.DataFrame:
-    work = events.copy()
-    if EVENT_ID_COLUMN in work.columns:
-        work["original_event_id"] = work[EVENT_ID_COLUMN].to_numpy()
-    else:
-        work["original_event_id"] = np.arange(len(work), dtype=np.int64)
 
-    # Force unique temp event id so mapping works
-    work[EVENT_ID_COLUMN] = np.arange(len(work), dtype=np.int64)
-    shell_block = build_shell_event_block(
-        block_df = work,
-        shell_table_df = shell_table_df,
-        feature_columns = phi_headers,
-        keep_event_data = False,
-    )
-
-    if len(shell_block.truth_shell) == 0:
-        return work.iloc[:0].copy()
-    valid_row_positions = np.asarray(shell_block.event_index, dtype=np.int64)
-
-    labeled = work.iloc[valid_row_positions].copy()
-    labeled[TARGET_COLUMN] = np.asarray(
-        shell_block.truth_shell,
-        dtype=np.int64,
-    )
-    
-    labeled["shell_index"] = np.asarray(
-        shell_block.human_shell,
-        dtype=np.int64,
-    )
-
-    return labeled.reset_index(drop=True)
-
-def compute_shell_class_weights(
-    pool: ShellH5EventPool,
-    *,
-    beta: float = 0.5,
-    max_weight: float | None = 20.0,
-):
-    """Compute the same optional inverse-frequency shell weights as the old pipeline."""
-    import torch
-
-    counts = np.zeros(pool.n_shells, dtype=np.float64)
-    for file_path in pool.files:
-        with h5py.File(file_path, "r") as f:
-            target_shell = np.asarray(f[TARGET_COLUMN], dtype=np.int64).reshape(-1)
-        counts += np.bincount(target_shell, minlength=pool.n_shells)
-
-    safe_counts = np.maximum(counts, 1.0)
-    weights = safe_counts ** (-float(beta))
-    present = counts > 0
-    if np.any(present):
-        weights[present] /= weights[present].mean()
-    weights[~present] = 0.0
-    if max_weight is not None:
-        weights = np.clip(weights, 0.0, float(max_weight))
-
-    return torch.tensor(weights, dtype=torch.float32)
-
-def shell_classification_loss(
-    logits,
-    target,
-    *,
-    sigma: float = 1.25,
-    hard_fraction: float = 0.5,
-    class_weights=None,
-):
-    """Shell-aware hard + Gaussian-smoothed categorical cross entropy.
-
-    This preserves the ordered-shell loss from the previous CNP pipeline while
-    keeping that shell-specific assumption outside the generic ``cnp.py``.
-    """
-    import torch
-    import torch.nn.functional as F
-
-    if sigma <= 0:
-        raise ValueError("sigma must be greater than zero")
-    if not 0.0 <= hard_fraction <= 1.0:
-        raise ValueError("hard_fraction must be between 0 and 1")
-
-    target = target.long().reshape(-1)
-    n_shells = logits.shape[-1]
-    shell_indices = torch.arange(n_shells, device=logits.device, dtype=logits.dtype)
-    distances = shell_indices.unsqueeze(0) - target.to(logits.dtype).unsqueeze(1)
-    gaussian_target = torch.exp(-0.5 * torch.square(distances / sigma))
-    gaussian_target = gaussian_target / gaussian_target.sum(
-        dim=-1,
-        keepdim=True,
-    ).clamp_min(1e-12)
-
-    hard_target = F.one_hot(target, num_classes=n_shells).to(dtype=logits.dtype)
-    soft_target = hard_fraction * hard_target + (1.0 - hard_fraction) * gaussian_target
-
-    log_probabilities = F.log_softmax(logits, dim=-1)
-    per_event_loss = -torch.sum(soft_target * log_probabilities, dim=-1)
-
-    if class_weights is not None:
-        weights = class_weights.to(device=logits.device, dtype=logits.dtype)
-        sample_weights = weights[target]
-        return torch.sum(sample_weights * per_event_loss) / sample_weights.sum().clamp_min(1e-12)
-
-    return per_event_loss.mean()
-
-def prepare_shell_cnp_data(
-    config: PreparationConfig,
-    *,
-    manifest_name: str = MANIFEST_NAME,
-) -> PreparationResult:
+def prepare_shell_cnp_data(config: PreparationConfig, *, manifest_name: str = MANIFEST_NAME) -> PreparationResult:
     """Run the existing raw-event -> shell-labelled HDF5 preparation pipeline."""
     config.validate()
     validation_fraction = config.split.validation_fraction
@@ -902,144 +898,78 @@ def prepare_shell_cnp_data(
         manifest_path=Path(manifest_path),
     )
 
-def build_shell_table(df_for_support: pd.DataFrame, shell_cfg: ShellConfig) -> pd.DataFrame:
-    boundaries = shell_boundaries(shell_cfg)
-    support_rows: list[dict[str, float | int]] = []
-
-    for i in range(1, shell_cfg.n_shells + 1):
-        prev = boundaries.iloc[i - 1]
-        curr = boundaries.iloc[i]
-        mask = inside_shell(
-            df_for_support,
-            R_inner=float(prev["R_boundary"]),
-            Z_inner=float(prev["Z_boundary"]),
-            R_outer=float(curr["R_boundary"]),
-            Z_outer=float(curr["Z_boundary"]),
-        )
-        outer_volume = 2.0*np.pi*float(curr["Z_boundary"])*float(curr["R_boundary"])**2
-        inner_volume = 2.0*np.pi*float(prev["Z_boundary"])*float(prev["R_boundary"])**2
-        shell_volume = outer_volume - inner_volume
-        support_rows.append(
-            {
-                "shell_index": int(i),
-                "class_index": int(i-1),
-                "R_inner": float(prev["R_boundary"]),
-                "Z_inner": float(prev["Z_boundary"]),
-                "R_shell": float(curr["R_boundary"]),
-                "Z_shell": float(curr["Z_boundary"]),
-                "candidate_events": int(mask.sum()),
-                "shell_volume": float(shell_volume),
-            }
-        )
-
-    out = pd.DataFrame(support_rows)
-    low_support = out[out["candidate_events"] < shell_cfg.min_candidate_events]
-    if not low_support.empty:
-        print("[warn] Some shell classes have low support, but they are kept for categorical CE because class IDs must remain fixed")
-
-    return out.sort_values(["shell_index"]).reset_index(drop=True)
-
-def shell_boundaries(shell_cfg: ShellConfig) -> pd.DataFrame:
-    idx = np.arange(0, shell_cfg.n_shells + 1, dtype=float)
-    frac = idx / float(shell_cfg.n_shells)
-    scale = frac ** shell_cfg.scale_power
-    r = shell_cfg.R_max * scale
-    z = shell_cfg.Z_max * scale
-    return pd.DataFrame(
-        {
-            "shell_level": idx.astype(int),
-            "R_boundary": r.astype(float),
-            "Z_boundary": z.astype(float),
-        }
-    )
-
-def inside_shell(
-    df: pd.DataFrame,
-    *,
-    R_inner: float,
-    Z_inner: float,
-    R_outer: float,
-    Z_outer: float,
-) -> np.ndarray:
-    required = {"r", Z_FROM_CENTER_COLUMN}
-    if not required.issubset(df.columns):
-        raise ValueError(f"Block dataframe must contain columns {required}.")
-
-    r = df["r"].to_numpy(dtype=float)
-    z = df[Z_FROM_CENTER_COLUMN].to_numpy(dtype=float)
-
-    inside_outer = (r <= R_outer) & (z <= Z_outer)
-    inside_inner = (r <= R_inner) & (z <= Z_inner)
-    return inside_outer & ~inside_inner
-
-def build_shell_event_block(
-    *,
-    block_df: pd.DataFrame,
-    shell_table_df: pd.DataFrame,
-    feature_columns: Sequence[str],
-    keep_event_data: bool=True,
-) -> ShellEventBlock:
-    missing_features = [col for col in feature_columns if col not in block_df.columns]
-    if missing_features:
-        raise ValueError(f"Block is missing required feature columns: {missing_features}")
-
-    positive_shell_one_based = positive_shells_for_block(
-        block_df=block_df, shell_table_df=shell_table_df,
-    )
-
-    valid_mask = positive_shell_one_based.notna()
-    if not valid_mask.any():
-        raise RuntimeError("This block has no events with a valid shell")
-    valid_events = block_df.loc[valid_mask].copy()
-
-    human_shell = positive_shell_one_based.loc[valid_mask].astype(np.int32).to_numpy()
-    truth_shell = human_shell.astype(np.int64) - 1
-    features = valid_events[list(feature_columns)].to_numpy(dtype=np.float32)
-    event_index = valid_events.index.to_numpy(dtype=np.int64)
-
-    if keep_event_data:
-        valid_events["event_index"] = event_index
-        valid_events["human_shell_index"] = human_shell
-        valid_events["truth_shell"] = truth_shell
-
-    return ShellEventBlock(
-        features=features,
-        truth_shell = truth_shell.astype(np.int64),
-        human_shell = human_shell.astype(np.int32),
-        event_index = event_index.astype(np.int64),
-        valid_events = valid_events
-    )
-
-def positive_shells_for_block(
-    block_df: pd.DataFrame,
-    shell_table_df: pd.DataFrame,
-) -> pd.Series:
-    """
-    Return one positive shell index per event
-    
-    The returned shell is one-indexed
-    Events outside the detector bounds are labelled NaN
-    """
-    positive_shell = pd.Series(np.nan, index=block_df.index, dtype="float")
-    
-    for row in shell_table_df.itertuples(index=False):
-        mask = inside_shell(
-            block_df,
-            R_inner=float(row.R_inner),
-            Z_inner=float(row.Z_inner),
-            R_outer=float(row.R_shell),
-            Z_outer=float(row.Z_shell),
-        )
-        positive_shell.loc[mask] = int(row.shell_index)
-
-    return positive_shell
-
 # -----------------------------------------------------------------------------
-# CNP Functions
+# CNP
 # -----------------------------------------------------------------------------
+
 Batch = tuple[np.ndarray, np.ndarray]
 BatchProvider = Callable[[int], Batch]
 EpochProvider = Callable[[int], Iterable[Batch]]
+
+@dataclass(frozen=True)
+class ShellPredictionResults:
+    """Outputs from running the CNP on a shell event pool"""
+    prediction_path: Path
+    n_events: int
+    n_groups: int
+
+def compute_shell_class_weights(pool: ShellH5EventPool, *, beta: float = 0.5, max_weight: float | None = 20.0):
+    """Compute the same optional inverse-frequency shell weights as the old pipeline."""
+    import torch
+
+    counts = np.zeros(pool.n_shells, dtype=np.float64)
+    for file_path in pool.files:
+        with h5py.File(file_path, "r") as f:
+            target_shell = np.asarray(f[TARGET_COLUMN], dtype=np.int64).reshape(-1)
+        counts += np.bincount(target_shell, minlength=pool.n_shells)
+
+    safe_counts = np.maximum(counts, 1.0)
+    weights = safe_counts ** (-float(beta))
+    present = counts > 0
+    if np.any(present):
+        weights[present] /= weights[present].mean()
+    weights[~present] = 0.0
+    if max_weight is not None:
+        weights = np.clip(weights, 0.0, float(max_weight))
+
+    return torch.tensor(weights, dtype=torch.float32)
+
+def shell_classification_loss(logits, target, *, sigma: float = 1.25, hard_fraction: float = 0.5, class_weights=None):
+    """Shell-aware hard + Gaussian-smoothed categorical cross entropy.
+
+    This preserves the ordered-shell loss from the previous CNP pipeline while
+    keeping that shell-specific assumption outside the generic ``cnp.py``.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if sigma <= 0:
+        raise ValueError("sigma must be greater than zero")
+    if not 0.0 <= hard_fraction <= 1.0:
+        raise ValueError("hard_fraction must be between 0 and 1")
+
+    target = target.long().reshape(-1)
+    n_shells = logits.shape[-1]
+    shell_indices = torch.arange(n_shells, device=logits.device, dtype=logits.dtype)
+    distances = shell_indices.unsqueeze(0) - target.to(logits.dtype).unsqueeze(1)
+    gaussian_target = torch.exp(-0.5 * torch.square(distances / sigma))
+    gaussian_target = gaussian_target / gaussian_target.sum(
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(1e-12)
+
+    hard_target = F.one_hot(target, num_classes=n_shells).to(dtype=logits.dtype)
+    soft_target = hard_fraction * hard_target + (1.0 - hard_fraction) * gaussian_target
+
+    log_probabilities = F.log_softmax(logits, dim=-1)
+    per_event_loss = -torch.sum(soft_target * log_probabilities, dim=-1)
+
+    if class_weights is not None:
+        weights = class_weights.to(device=logits.device, dtype=logits.dtype)
+        sample_weights = weights[target]
+        return torch.sum(sample_weights * per_event_loss) / sample_weights.sum().clamp_min(1e-12)
+
+    return per_event_loss.mean()
 
 class ShellH5EventPool:
     """
@@ -1104,13 +1034,11 @@ class ShellH5EventPool:
             if missing:
                 raise ValueError(f"{file_path.name}: missing HDF5 datasets {sorted(missing)}")
 
-            # Read the H5
             theta = np.asarray(f["theta"], dtype=np.float32)
             phi = np.asarray(f["phi"], dtype=np.float32)
             target_shell = np.asarray(f[TARGET_COLUMN], dtype=np.int64).reshape(-1)
             meta = self._read_meta(f)
 
-            # Validate the data
             if theta.ndim != 2:
                 raise ValueError(f"{file_path.name}: expected theta shape (N, theta_dim), got {theta.shape}")
             if phi.ndim != 2:
@@ -1152,7 +1080,6 @@ class ShellH5EventPool:
                 raise ValueError(f"{file_path.name}: fidelity has {len(fidelity)} values for {len(target_shell)} events")
             meta["fidelity"] = _validate_fidelity_series(fidelity, context=f"{file_path.name} meta/fidelity",).to_numpy(dtype=np.int32)
 
-            # Actually assign x
             x = np.concatenate([theta, phi], axis=1).astype(np.float32)
 
         result = (x, target_shell, meta)
@@ -1182,13 +1109,11 @@ class ShellH5EventPool:
         if batch_size <= 0:
             raise ValueError("Batch size must be positive")
 
-        # Choose which files to take from
         chosen = self._choose_files(files_per_batch)
         per_file = max(1, int(np.ceil(batch_size / len(chosen))))
         x_parts: list[np.ndarray] = []
         y_parts: list[np.ndarray] = []
 
-        # Grab the actual x and y from those files
         for file_path in chosen:
             x, y, _meta = self._load_one(file_path)
             if len(y) == 0:
@@ -1198,8 +1123,7 @@ class ShellH5EventPool:
             y_parts.append(y[indices])
         if not x_parts:
             raise RuntimeError("Could not sample a non-empty batch from HDF5 files")
-        
-        # Make the batches that the CNP uses
+
         x_batch = np.vstack(x_parts).astype(np.float32)[:batch_size]
         y_batch = np.concatenate(y_parts).astype(np.int64)[:batch_size]
         return x_batch, y_batch
@@ -1218,7 +1142,6 @@ class ShellH5EventPool:
         if files_per_batch <= 0:
             raise ValueError("files_per_batch must be positive")
 
-        # Make sure there is a concrete order
         file_order = list(self.files)
         if shuffle and len(file_order) > 1:
             order = self.rng.permutation(len(file_order))
@@ -1254,7 +1177,7 @@ class ShellH5EventPool:
 
             x_buffer = [x_all] if len(y_all) else []
             y_buffer = [y_all] if len(y_all) else []
-        
+
         if y_buffer and len(y_buffer[0]) and not drop_last:
             yield x_buffer[0], y_buffer[0]
 
@@ -1351,7 +1274,6 @@ def build_shell_cnp_providers(
             "[warn] No held-out validation HDF5 blocks were found; "
             "validation_batch_fn will sample from the training pool."
         )
-    # Keep inference context selection independent of the training sampler state.
     inference_pool = ShellH5EventPool(
         prepared_dir / "training",
         theta_headers=theta_headers,
@@ -1370,8 +1292,9 @@ def build_shell_cnp_providers(
     )
 
 # -----------------------------------------------------------------------------
-# MFGP Functions
+# MF-GP
 # -----------------------------------------------------------------------------
+
 @dataclass(slots=True)
 class ShellMFGPValidationData:
     """Shell-specific held-out data converted to generic MF-GP validation inputs."""
@@ -1381,15 +1304,7 @@ class ShellMFGPValidationData:
     frame: pd.DataFrame
     input_names: list[str]
 
-# -----------------------------------------------------------------------------
-# MF-GP Adapters
-# -----------------------------------------------------------------------------
-def _load_shell_mfgp_rows(
-    cnp_prediction_path: str | Path,
-    *,
-    shell_n: int,
-    iteration: int = 0,
-) -> pd.DataFrame:
+def _load_shell_mfgp_rows(cnp_prediction_path: str | Path, *, shell_n: int, iteration: int = 0) -> pd.DataFrame:
     """Load shell CNP output and validate it for conversion to MF-GP inputs."""
     cnp_prediction_path = Path(cnp_prediction_path)
     if not cnp_prediction_path.exists():
@@ -1411,7 +1326,6 @@ def _load_shell_mfgp_rows(
     if missing:
         raise ValueError(f"CNP prediction file is missing required columns: {missing}")
 
-    # Convert required numeric values.
     numeric_columns = [
         *THETA_HEADERS,
         "iteration",
@@ -1428,13 +1342,11 @@ def _load_shell_mfgp_rows(
         bad_columns = [column for column in numeric_columns if df[column].isna().any()]
         raise ValueError(f"CNP prediction file contains missing or non-numeric values in {bad_columns}")
 
-    # Validate fidelity using the same convention as the rest of the shell code.
     df["fidelity"] = _validate_fidelity_series(
         df["fidelity"],
         context=f"MF-GP adapter input {cnp_prediction_path.name}",
     ).astype(np.int32)
 
-    # shell_index must be a positive integer.
     shell_values = df["shell_index"].to_numpy(dtype=float)
     if not np.allclose(shell_values, np.rint(shell_values)):
         raise ValueError("shell_index contains non-integer values")
@@ -1445,18 +1357,15 @@ def _load_shell_mfgp_rows(
 
     if shell_n > max_shell:
         raise ValueError(f"Requested shell_n={shell_n}, but CNP output only contains shells through {max_shell}")
-    
-    # Select requested CNP iteration.
+
     df = df[df["iteration"].astype(int) == int(iteration)].copy()
     if df.empty:
         raise ValueError(f"No CNP prediction rows found for iteration={iteration}")
 
-    # Keep the containment region shell 1 ... shell_n.
     df = df[df["shell_index"] <= int(shell_n)].copy()
     if df.empty:
         raise ValueError(f"No shell rows found in containment region 1..{shell_n}")
 
-    # Every geometry/fidelity must have exactly one row for every selected shell.
     expected_shells = set(range(1, int(shell_n) + 1))
     group_columns = [*THETA_HEADERS, "fidelity"]
     problems = []
@@ -1510,21 +1419,27 @@ def build_shell_mfgp_training_data(
     if hf.empty:
         raise ValueError("Shell CNP training output contains no fidelity=1 high-fidelity rows")
 
-    # Collapse shells 1..shell_n into one containment probability per geometry.
     lf = (
-        lf.groupby(THETA_HEADERS, as_index=False, sort=True).agg(
+        lf.groupby(THETA_HEADERS, as_index=False, sort=True)
+        .agg(
             y_lf=("y_cnp", "sum"),
             y_lf_err=(
                 "y_cnp_err",
-                lambda values: float(np.sqrt(np.sum(np.square(values.to_numpy(dtype=float)))))))
+                lambda values: float(np.sqrt(np.sum(np.square(values.to_numpy(dtype=float))))),
+            ),
+        )
         .sort_values(THETA_HEADERS, kind="mergesort")
-        .reset_index(drop=True))
+        .reset_index(drop=True)
+    )
 
     hf = (
         hf.groupby(THETA_HEADERS, as_index=False, sort=True)
-        .agg(y_hf=("y_raw", "sum"),)
+        .agg(
+            y_hf=("y_raw", "sum"),
+        )
         .sort_values(THETA_HEADERS, kind="mergesort")
-        .reset_index(drop=True))
+        .reset_index(drop=True)
+    )
 
     x_lf = lf[THETA_HEADERS].to_numpy(dtype=float)
     y_lf = lf["y_lf"].to_numpy(dtype=float)
@@ -1556,20 +1471,22 @@ def build_shell_mfgp_validation_data(
         iteration=iteration,
     )
 
-    # MF-GP validation compares against held-out HF truth.
     hf = df[df["fidelity"] == 1].copy()
 
     if hf.empty:
         raise ValueError("Shell CNP validation output contains no fidelity=1 high-fidelity rows")
     validation = (
         hf.groupby(THETA_HEADERS, as_index=False, sort=True)
-        .agg(y_true=("y_raw", "sum"))
-        .sort_values(THETA_HEADERS, kind="mergesort",)
-        .reset_index(drop=True))
+        .agg(
+            y_true=("y_raw", "sum"),
+        )
+        .sort_values(THETA_HEADERS, kind="mergesort")
+        .reset_index(drop=True)
+    )
 
     x = validation[THETA_HEADERS].to_numpy(dtype=float)
     y_true = validation["y_true"].to_numpy(dtype=float)
-    
+
     return ShellMFGPValidationData(
         x=x,
         y_true=y_true,
@@ -1580,12 +1497,9 @@ def build_shell_mfgp_validation_data(
 # -----------------------------------------------------------------------------
 # Runners
 # -----------------------------------------------------------------------------
-def run_shell_cnp_training(
-    shell_config_path: str | Path,
-    cnp_config_path: str | Path,
-) -> cnp.TrainResult:
+
+def run_shell_cnp_training(shell_config_path: str | Path, cnp_config_path: str | Path) -> cnp.TrainResult:
     """Wrapper for cnp training with specifically shell inputs"""
-    # Load the configs
     shell_raw = load_config(shell_config_path)
     cnp_raw = load_config(cnp_config_path)
     shell_cfg = shell_raw["shell"]
@@ -1597,11 +1511,9 @@ def run_shell_cnp_training(
     model_cfg = cnp_raw.get("model", {})
     optimizer_cfg = cnp_raw.get("optimizer", {})
 
-    # Grab prepared shell data
     prepared_dir = Path(shell_raw["data"]["output_dir"])
     n_shells = int(shell_cfg.get("n_shells", 100))
 
-    # Build shell-specific CNP Providers
     providers = build_shell_cnp_providers(
         prepared_dir=prepared_dir,
         n_shells=n_shells,
@@ -1611,27 +1523,25 @@ def run_shell_cnp_training(
         cache_training_files=bool(provider_cfg.get("cache_training_files", True)),
     )
 
-    # Set class weights
     class_weights = None
     if bool(loss_cfg.get("use_class_weights", False)):
         class_weights = compute_shell_class_weights(
-            providers.training_pool, 
-            beta=float(loss_cfg.get("class_weight_beta", 0.5)), 
-            max_weight=loss_cfg.get("class_weight_max", 20.0))
+            providers.training_pool,
+            beta=float(loss_cfg.get("class_weight_beta", 0.5)),
+            max_weight=loss_cfg.get("class_weight_max", 20.0),
+        )
 
-    # Shell specific loss
     loss_fn = partial(
-        shell_classification_loss, 
-        sigma=float(loss_cfg.get("sigma", 1.25)), 
-        hard_fraction=float(loss_cfg.get("hard_fraction", 0.5)), 
-        class_weights=class_weights)
+        shell_classification_loss,
+        sigma=float(loss_cfg.get("sigma", 1.25)),
+        hard_fraction=float(loss_cfg.get("hard_fraction", 0.5)),
+        class_weights=class_weights,
+    )
 
-    # Device
     device = run_cfg.get("device", "auto")
     if device == "auto":
         device = None
 
-    # Run the actual training
     return cnp.train_cnp(
         train_batch_fn=providers.train_batch_fn,
         validation_batch_fn=providers.validation_batch_fn,
@@ -1658,20 +1568,23 @@ def run_shell_cnp_training(
         device=device,
         input_names=[*THETA_HEADERS, *PHI_HEADERS],
         class_names=[f"shell_{i}" for i in range(1, n_shells + 1)],
-        checkpoint_metadata={"distribution": "position_shells", "n_shells": n_shells, "scale_power": float(shell_cfg.get("scale_power", 1.0 / 3.0))},
+        checkpoint_metadata={
+            "distribution": "position_shells",
+            "n_shells": n_shells,
+            "scale_power": float(shell_cfg.get("scale_power", 1.0 / 3.0)),
+        },
     )
-        
+
 def run_shell_cnp_prediction(
     shell_config_path: str | Path,
-    cnp_config_path: str | Path, 
+    cnp_config_path: str | Path,
     *,
     split: str = "validation",
-    model_path: str | Path | None = None, 
+    model_path: str | Path | None = None,
     output_path: str | Path | None = None,
     iteration: int = 0
 ) -> ShellPredictionResults:
     """Wrapper for CNP prediction based on shells. Handles pool construction, generic CNP inference, shell aggregation, and CSV output."""
-    # Load configs
     shell_raw = load_config(shell_config_path)
     cnp_raw = load_config(cnp_config_path)
     shell_cfg = shell_raw["shell"]
@@ -1681,7 +1594,6 @@ def run_shell_cnp_prediction(
     n_shells = int(shell_cfg.get("n_shells", 100))
     prepared_dir = Path(shell_raw["data"]["output_dir"])
 
-    # Choose prediction data
     split = split.lower()
     if split == "training":
         pool_dir = prepared_dir / "training"
@@ -1690,17 +1602,15 @@ def run_shell_cnp_prediction(
     else:
         raise ValueError("split must be either 'training' or 'validation'")
 
-    # Build prediction pool
     pool = ShellH5EventPool(
-        pool_dir, 
-        theta_headers=THETA_HEADERS, 
-        phi_headers=PHI_HEADERS, 
-        n_shells=n_shells, 
-        seed=int(run_cfg.get("seed", 42)), 
+        pool_dir,
+        theta_headers=THETA_HEADERS,
+        phi_headers=PHI_HEADERS,
+        n_shells=n_shells,
+        seed=int(run_cfg.get("seed", 42)),
         cache_files=False,
     )
 
-    # CNP output/model information
     cnp_output_dir = Path(run_cfg.get("output_dir", "cnp_outputs"))
     cnp_output_dir.mkdir(parents=True, exist_ok=True)
     version = str(run_cfg.get("version", "default"))
@@ -1715,7 +1625,6 @@ def run_shell_cnp_prediction(
     if not model_path.exists():
         raise FileNotFoundError(f"CNP model does not exist: {model_path}")
 
-    # Device
     device = run_cfg.get("device", "auto")
     if device == "auto":
         device = None
@@ -1723,7 +1632,6 @@ def run_shell_cnp_prediction(
     mc_samples = int(prediction_cfg.get("mc_samples", 30))
     chunk_size = int(prediction_cfg.get("chunk_size", 20000))
 
-    # Accumulate predictions by split/fidelity/detector geometry
     accumulators: dict[tuple, dict[str, object]] = {}
     total_events = 0
 
@@ -1732,10 +1640,9 @@ def run_shell_cnp_prediction(
         n_events = len(true_shell)
         if n_events == 0:
             continue
-    
+
         pbar.set_postfix(file=file_path.name, events=f"{n_events:,}")
 
-        # Generic CNP prediction
         prediction = cnp.predict_distribution(model_path=model_path, x=x, mc_samples=mc_samples, chunk_size=chunk_size, device=device)
 
         probabilities = np.asarray(prediction.probabilities, dtype=np.float64)
@@ -1748,7 +1655,6 @@ def run_shell_cnp_prediction(
         if uncertainties.shape != expected_shape:
             raise ValueError(f"{file_path.name}: uncertainty shape {uncertainties.shape} does not match expected {expected_shape}")
 
-        # Get shell/detector metadata
         split_name = _prediction_meta_array(meta, "split_name", n_events, file_path=file_path).astype(str)
         fidelity = _prediction_meta_array(meta, "fidelity", n_events, file_path=file_path).astype(np.int32)
         detector_R = _prediction_meta_array(meta, "detector_R", n_events, file_path=file_path).astype(float)
@@ -1756,15 +1662,14 @@ def run_shell_cnp_prediction(
         detector_z_center = _prediction_meta_array(meta, "detector_z_center", n_events, file_path=file_path).astype(float)
 
         group_data = pd.DataFrame({
-            "split_name": split_name, 
-            "fidelity": fidelity, 
-            "detector_R": detector_R, 
-            "detector_Z": detector_Z, 
+            "split_name": split_name,
+            "fidelity": fidelity,
+            "detector_R": detector_R,
+            "detector_Z": detector_Z,
             "detector_z_center": detector_z_center
         })
         group_columns = ["split_name", "fidelity", "detector_R", "detector_Z", "detector_z_center"]
 
-        # Aggregate event-level predictions by detector geometry/fidelity
         for group_key, indices in group_data.groupby(group_columns, sort=False).indices.items():
             indices = np.asarray(indices, dtype=np.int64)
 
@@ -1787,7 +1692,6 @@ def run_shell_cnp_prediction(
 
         total_events += n_events
 
-    # Convert accumulated values into one row per shell
     rows: list[dict] = []
     for group_key, state in accumulators.items():
         split_value, fidelity_value, detector_R_value, detector_Z_value, detector_z_center_value = group_key
@@ -1880,7 +1784,7 @@ def run_shell_mfgp_prediction(
         shell_n=n_shell,
         iteration=iteration,
     )
-    
+
     return mfgp.run_mfgp_prediction(
         mfgp_config_path,
         model_path=model_path,
